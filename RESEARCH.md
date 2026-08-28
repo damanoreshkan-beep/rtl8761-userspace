@@ -112,9 +112,13 @@ fetch at setup, gitignore the .bin (same rule as ax56 fw).
    default masks LE Meta bit 61, so adv reports never arrive without this), then
    `LE_Set_Scan_Params`/`Enable`; parse `LE_Advertising_Report` on EP 0x81. Real result:
    8 nearby BLE devices with MAC + RSSI + names. ✓ **v1 BLE sniffer complete.**
-7. **LE advertise**: set adv data + enable. verify: seen from a second device. (next)
+7. **LE advertise — IMPLEMENTED.** `Read_BD_ADDR` (public 00:e0:4c… Realtek OUI),
+   `LE_Set_Advertising_Parameters` (ADV_IND, ~100ms, all channels),
+   `LE_Set_Advertising_Data` (Flags + Complete Local Name), `LE_Set_Advertise_Enable` —
+   all status 0, broadcasts a named device. verify: seen from a phone BLE scanner
+   (single radio can't self-verify; pending visual confirmation). (`btctl adv`)
 
-v1 = milestones 1–6 (a working BLE sniffer) — DONE. Advertise/connect next.
+v1 = milestones 1–6 (a working BLE sniffer) — DONE. Advertise implemented (7). Connect next.
 
 ### Gotchas nailed (for the write-up)
 - fw does NOT survive a USB reset on callback close → each fresh termux-usb invocation is

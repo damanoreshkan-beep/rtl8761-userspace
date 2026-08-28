@@ -272,6 +272,36 @@ if (action === "desc") {
   const rows = [...seen.entries()].sort((a, b) => b[1].rssi - a[1].rssi);
   out(`scan: ${rows.length} device(s) (${rawEvents} raw events)\n`);
   for (const [mac, v] of rows) out(`  ${mac}  ${String(v.rssi).padStart(4)} dBm  ${v.name}\n`);
+} else if (action === "adv") {
+  // LE advertise. Self-contained: downloads fw first if the chip is still in ROM.
+  if (!claim(0)) { out(`adv: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  const sv = await ensurePatched();
+  out(`adv: controller lmp_subver=0x${(sv >>> 0).toString(16)}${sv === 0x8761 ? " (STILL ROM!)" : " (patched)"}\n`);
+
+  const bd = cmdC(0x04, 0x009); // Read_BD_ADDR
+  const mac = bd.status === 0 && bd.ret.length >= 6
+    ? Array.from(bd.ret.subarray(0, 6)).reverse().map(h).join(":") : "??";
+
+  // LE_Set_Advertising_Parameters: ADV_IND (connectable), interval 0x00A0 (~100ms),
+  // public addr, all 3 channels (0x07), no filter.
+  const ap = cmdC(0x08, 0x006, Uint8Array.from([0xa0, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00]));
+
+  // Build 31-byte adv data: Flags (LE general disc, no BR/EDR) + Complete Local Name.
+  const name = enc.encode(Deno.env.get("BT_ADV_NAME") ?? "RTL8761-AW");
+  const ad = new Uint8Array(32); // [sig_len][31 bytes]
+  let o = 1;
+  ad[o++] = 0x02; ad[o++] = 0x01; ad[o++] = 0x06;              // Flags
+  ad[o++] = 1 + name.length; ad[o++] = 0x09; ad.set(name, o); o += name.length; // Complete Local Name
+  ad[0] = o - 1;                                                // significant length
+  const sd = cmdC(0x08, 0x008, ad);                            // LE_Set_Advertising_Data
+  const en = cmdC(0x08, 0x00a, Uint8Array.from([0x01]));       // LE_Set_Advertise_Enable
+
+  const secs = Number(Deno.env.get("BT_ADV_SECS") ?? "20");
+  out(`adv: params=${ap.status} data=${sd.status} enable=${en.status}\n`);
+  out(`adv: broadcasting "${new TextDecoder().decode(name)}" as ${mac} for ${secs}s — look on a phone BLE scanner\n`);
+  await new Promise((r) => setTimeout(r, secs * 1000));
+  cmdC(0x08, 0x00a, Uint8Array.from([0x00]));                  // LE_Set_Advertise_Enable off
+  out(`adv: stopped\n`);
 } else if (action === "romver") {
   // Read ROM Version: vendor OGF=0x3f, OCF=0x06d (opcode 0xFC6D). Selects the fw patch.
   if (!claim(0)) { out(`romver: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
