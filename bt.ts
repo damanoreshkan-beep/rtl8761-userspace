@@ -522,20 +522,19 @@ if (action === "desc") {
   const mac = bd.status === 0 && bd.ret.length >= 6
     ? Array.from(bd.ret.subarray(0, 6)).reverse().map(h).join(":") : "??";
 
-  // LE_Set_Advertising_Parameters: ADV_IND (connectable), interval 0x00A0 (~100ms),
-  // public addr, all 3 channels (0x07), no filter.
-  const ap = cmdC(0x08, 0x006, Uint8Array.from([0xa0, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00]));
-
-  // Build the advertising payload from a ready-made preset catalogue (BT_ADV_PRESET):
-  //   swiftpair  -> Microsoft Swift Pair beacon (Windows shows a "Connect" toast)
-  //   ibeacon    -> Apple iBeacon (company 0x004C, 02 15 + uuid/major/minor/power)
-  //   eddystone  -> Google Eddystone-URL (service data 0xFEAA)
-  //   (none)     -> plain Flags + Complete Local Name
+  // Ready-made preset catalogue (BT_ADV_PRESET): swiftpair | ibeacon | eddystone | apple | fastpair.
   const preset = (Deno.env.get("BT_ADV_PRESET") ?? "").toLowerCase();
   const name = enc.encode(Deno.env.get("BT_ADV_NAME") ?? (preset === "swiftpair" ? "hello" : "RTL8761-AW"));
+
+  // Apple Continuity beacons are broadcast NON-connectable with NO Flags section (the host's
+  // hardware-offload filter expects the manufacturer data at the front); everything else uses
+  // connectable ADV_IND with a Flags section. adv_type: 0x00 = ADV_IND, 0x03 = ADV_NONCONN_IND.
+  const advType = preset === "apple" ? 0x03 : 0x00;
+  const ap = cmdC(0x08, 0x006, Uint8Array.from([0xa0, 0x00, 0xa0, 0x00, advType, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00]));
+
   const parts: number[] = [];
   const addAD = (type: number, data: number[]) => { parts.push(data.length + 1, type, ...data); };
-  addAD(0x01, [0x06]);                                          // Flags: LE General Discoverable, no BR/EDR
+  if (preset !== "apple") addAD(0x01, [0x06]);                  // Flags: LE General Discoverable, no BR/EDR
   let label: string;
   if (preset === "swiftpair") {
     // Microsoft Swift Pair: FF | 06 00 (MS vendor 0x0006) | 03 (beacon id) | 00 (BLE-only) | 80 (reserved rssi) | name
