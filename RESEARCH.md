@@ -164,7 +164,20 @@ Bugs fixed along the way:
 
 v1 = milestones 1–6 (BLE sniffer) DONE. Advertise (7), Connect+discovery (8), Read chars (9),
 Notifications (10), Writes (11) DONE. Complete no-root BLE central: scan / advertise / connect
-/ discover / read / subscribe / write. Next: a touch-TUI, or descriptor writes / bonding.
+/ discover / read / subscribe / write.
+
+### Advertising presets (`adv`, BT_ADV_PRESET) — ready-made beacons
+- **swiftpair** — Microsoft Swift Pair beacon so Windows 10/11 pops a "New <name> found —
+  Connect" toast. Per the MS spec (component-guidelines/bluetooth-swift-pair): AD `FF | 06 00`
+  (vendor 0x0006) `| 03` (beacon id) `| 00` (sub-scenario: pairing over BLE only) `| 80`
+  (reserved RSSI) `| <name>`, plus a Complete Local Name AD in the same connectable ADV_IND
+  packet (Windows does not active-scan, so name must be in the advert, not the scan response).
+  `BT_ADV_NAME=hello`. Windows needs "Show notifications to connect using Swift Pair" on, and
+  shows only one toast per session per device.
+- **ibeacon** — Apple iBeacon: MSD company 0x004C, `02 15` + 16B UUID + major + minor + power.
+- **eddystone** — Google Eddystone-URL: 16-bit service UUID 0xFEAA + Service Data URL frame.
+
+Next: a touch-TUI, or descriptor writes / bonding.
 
 ## Test rig — box as a BLE peripheral
 `ssh box` (Intel 8260, BlueZ). Two peers, both hold via a live process (advertisement drops

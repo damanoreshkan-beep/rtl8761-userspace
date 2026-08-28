@@ -7,7 +7,8 @@
 #   btctl romver <dev>   # vendor Read_ROM_Version (0xFC6D)
 #   btctl fwdl   <dev>   # download rtl8761bu fw+config, HCI_Reset, verify patched subver
 #   btctl scan   <dev>   # LE active scan (auto-downloads fw first). BT_SCAN_SECS=5
-#   btctl adv    <dev>   # LE advertise as a named device. BT_ADV_NAME, BT_ADV_SECS=20
+#   btctl adv    <dev>   # LE advertise. BT_ADV_NAME, BT_ADV_SECS, BT_ADV_PRESET=
+#                        #   swiftpair (Windows Connect toast) | ibeacon | eddystone
 #   btctl connect <dev>  # LE connect + GATT primary services. BT_TARGET=<mac>, BT_SCAN_SECS
 #   btctl read   <dev>   # LE connect + discover characteristics + read readable values
 #   btctl notify <dev>   # subscribe to a notify/indicate char. BT_NOTIFY_UUID, BT_NOTIFY_SECS
