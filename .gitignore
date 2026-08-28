@@ -1,0 +1,7 @@
+# Realtek BT firmware — fetch from linux-firmware rtl_bt/, not vendored
+*.bin
+# termux-usb runtime callback the tool writes
+.cb.sh
+# logs / scratch
+*.log
+out*.txt

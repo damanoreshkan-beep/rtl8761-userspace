@@ -1,0 +1,289 @@
+// bt.ts — userspace HCI recon core for RTL8761 USB Bluetooth, no root.
+// Runs as a termux-usb callback: argv[0] = inherited usbfs fd. Action via BT_ACTION env.
+// RESEARCH SLICE: descriptor dump + HCI Read Local Version. Nothing is written to the
+// chip except a single HCI command over the control endpoint (the standard transport).
+
+const fd = Number(Deno.args[0]);
+const action = Deno.env.get("BT_ACTION") ?? "desc";
+
+const libc = Deno.dlopen("libc.so.6", {
+  ioctl: { parameters: ["i32", "u64", "buffer"], result: "i32" },
+  pread: { parameters: ["i32", "buffer", "usize", "i64"], result: "isize" },
+  __errno_location: { parameters: [], result: "pointer" },
+});
+const errno = () => new Deno.UnsafePointerView(libc.symbols.__errno_location()!).getInt32();
+
+const IOCTL = {
+  CLAIM: 0x8004550Fn,
+  DISCONNECT_CLAIM: 0x8108551Bn,
+  CONTROL: 0xC0185500n,
+  BULK: 0xC0185502n,
+} as const;
+
+function claim(iface = 0): boolean {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, iface, true);
+  if (libc.symbols.ioctl(fd, IOCTL.CLAIM, b) >= 0) return true;
+  const dc = new Uint8Array(264);
+  const dv = new DataView(dc.buffer);
+  dv.setUint32(0, iface, true);
+  dv.setUint32(4, 2, true); // USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER=2 -> unconditional
+  return libc.symbols.ioctl(fd, IOCTL.DISCONNECT_CLAIM, dc) >= 0;
+}
+
+function control(reqType: number, req: number, val: number, idx: number, data: Uint8Array, timeout = 1000): number {
+  const r = new Uint8Array(24);
+  const dv = new DataView(r.buffer);
+  dv.setUint8(0, reqType);
+  dv.setUint8(1, req);
+  dv.setUint16(2, val, true);
+  dv.setUint16(4, idx, true);
+  dv.setUint16(6, data.length, true);
+  dv.setUint32(8, timeout, true);
+  dv.setBigUint64(16, BigInt(Deno.UnsafePointer.value(Deno.UnsafePointer.of(data))), true);
+  const rc = libc.symbols.ioctl(fd, IOCTL.CONTROL, r);
+  return rc < 0 ? -errno() : rc;
+}
+
+function bulk(ep: number, buf: Uint8Array, timeout = 2000): number {
+  const r = new Uint8Array(24);
+  const dv = new DataView(r.buffer);
+  dv.setUint32(0, ep, true);
+  dv.setUint32(4, buf.length, true);
+  dv.setUint32(8, timeout, true);
+  dv.setBigUint64(16, BigInt(Deno.UnsafePointer.value(Deno.UnsafePointer.of(buf))), true);
+  const rc = libc.symbols.ioctl(fd, IOCTL.BULK, r);
+  return rc < 0 ? -errno() : rc;
+}
+
+const enc = new TextEncoder();
+const out = (s: string) => Deno.stdout.writeSync(enc.encode(s));
+
+// --- HCI helpers (defined here so both fwdl and scan can ensure a patched controller) ---
+function readEvent(timeout = 1500): Uint8Array {
+  const ev = new Uint8Array(260);
+  const n = bulk(0x81, ev, timeout);
+  return n > 0 ? ev.subarray(0, n) : new Uint8Array(0);
+}
+// send a command, read its Command Complete (skipping stray events like adv reports);
+// match the echoed opcode. Returns {status, ret} (ret = params after status).
+function cmdC(ogf: number, ocf: number, params?: Uint8Array): { status: number; ret: Uint8Array } {
+  const opcode = (ogf << 10) | ocf;
+  const lo = opcode & 0xff, hi = (opcode >> 8) & 0xff;
+  hciCmd(ogf, ocf, params);
+  for (let tries = 0; tries < 12; tries++) {
+    const ev = readEvent(1500);
+    if (ev.length === 0) break;
+    if (ev[0] === 0x0e && ev.length >= 6 && ev[3] === lo && ev[4] === hi) {
+      return { status: ev[5], ret: ev.subarray(6) };
+    }
+    // ignore other events (0x3e adv reports, command-status, etc.) and keep reading
+  }
+  return { status: -1, ret: new Uint8Array(0) };
+}
+function localSubver(): number {
+  const { status, ret } = cmdC(0x04, 0x0001); // Read_Local_Version
+  return status === 0 && ret.length >= 8 ? (ret[6] | (ret[7] << 8)) : -1;
+}
+// Download fw+config if the controller is still running the ROM bootloader (subver 0x8761).
+async function ensurePatched(): Promise<number> {
+  cmdC(0x03, 0x003);            // HCI_Reset first: stop any leftover scan, flush state
+  let sv = localSubver();
+  if (sv === 0xd922) return sv; // already running the patched build — nothing to do
+  const { parseFirmware } = await import(new URL("./fw.ts", import.meta.url).href);
+  const rd = (n: string) => Deno.readFileSync(new URL("./" + n, import.meta.url).pathname);
+  const romVersion = cmdC(0x3f, 0x06d).ret[0]; // Read_ROM_Version
+  const plan = parseFirmware(rd("rtl8761bu_fw.bin"), rd("rtl8761bu_config.bin"), romVersion);
+  const pl: Uint8Array = plan.payload;
+  const CHUNK = 252, frags = Math.ceil(pl.length / CHUNK);
+  for (let i = 0; i < frags; i++) {
+    const slice = pl.subarray(i * CHUNK, i * CHUNK + CHUNK);
+    const param = new Uint8Array(1 + slice.length);
+    param[0] = (i & 0x7f) | (i === frags - 1 ? 0x80 : 0);
+    param.set(slice, 1);
+    if (cmdC(0x3f, 0x020, param).status !== 0) throw new Error(`fwdl frag ${i} failed`);
+  }
+  cmdC(0x03, 0x003); // HCI_Reset
+  await new Promise((r) => setTimeout(r, 300));
+  sv = localSubver();
+  return sv;
+}
+const hex = (b: Uint8Array, n = b.length) =>
+  Array.from(b.subarray(0, n)).map((x) => x.toString(16).padStart(2, "0")).join(" ");
+
+// Read the whole descriptor blob usbfs exposes at the fd: device desc then all config descs.
+function readDescriptors(): Uint8Array {
+  const buf = new Uint8Array(1024);
+  const n = Number(libc.symbols.pread(fd, buf, BigInt(buf.length), 0n));
+  return buf.subarray(0, Math.max(0, n));
+}
+
+function parseDescriptors(d: Uint8Array) {
+  let i = 0;
+  while (i + 2 <= d.length) {
+    const len = d[i], type = d[i + 1];
+    if (len === 0) break;
+    if (type === 0x01) {
+      out(`DEVICE   vid=${le(d, 8)} pid=${le(d, 10)} usb=${le(d, 2)} class=${h(d[4])}/${h(d[5])}/${h(d[6])} numCfg=${d[i + 17]}\n`);
+    } else if (type === 0x02) {
+      out(`CONFIG   nIface=${d[i + 4]} cfgVal=${d[i + 5]} attr=${h(d[i + 7])} maxPower=${d[i + 8] * 2}mA\n`);
+    } else if (type === 0x04) {
+      out(`  IFACE  num=${d[i + 2]} alt=${d[i + 3]} nEP=${d[i + 4]} class=${h(d[i + 5])}/${h(d[i + 6])}/${h(d[i + 7])}\n`);
+    } else if (type === 0x05) {
+      const addr = d[i + 2], attr = d[i + 3];
+      const dir = addr & 0x80 ? "IN " : "OUT";
+      const kinds = ["control", "isoc", "bulk", "interrupt"];
+      const mps = d[i + 4] | (d[i + 5] << 8);
+      out(`    EP   0x${addr.toString(16).padStart(2, "0")} ${dir} ${kinds[attr & 3].padEnd(9)} mps=${mps} interval=${d[i + 6]}\n`);
+    }
+    i += len;
+  }
+}
+const h = (x: number) => x.toString(16).padStart(2, "0");
+const le = (d: Uint8Array, i: number) => h(d[i + 1]) + h(d[i]);
+
+// HCI command over the control endpoint: bmRequestType=0x20, bRequest=0, value=0, index=0.
+function hciCmd(ogf: number, ocf: number, params: Uint8Array = new Uint8Array(0)): number {
+  const opcode = (ogf << 10) | ocf;
+  const pkt = new Uint8Array(3 + params.length);
+  pkt[0] = opcode & 0xff;
+  pkt[1] = (opcode >> 8) & 0xff;
+  pkt[2] = params.length;
+  pkt.set(params, 3);
+  return control(0x20, 0x00, 0x0000, 0x0000, pkt);
+}
+
+if (action === "desc") {
+  const d = readDescriptors();
+  if (d.length < 18) { out(`desc: short read (${d.length} bytes) errno=${errno()}\n`); Deno.exit(1); }
+  out(`raw ${d.length} bytes\n`);
+  parseDescriptors(d);
+} else if (action === "hci") {
+  // Read Local Version Information: OGF=0x04 (Informational), OCF=0x0001.
+  if (!claim(0)) { out(`hci: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  const sent = hciCmd(0x04, 0x0001);
+  out(`hci: Read_Local_Version sent rc=${sent}\n`);
+  // Event comes back on the interrupt-IN endpoint. Try the common addresses.
+  for (const ep of [0x81, 0x82, 0x83]) {
+    const ev = new Uint8Array(64);
+    const n = bulk(ep, ev, 1500);
+    if (n > 0) { out(`  event on EP 0x${ep.toString(16)}: ${hex(ev, n)}\n`); break; }
+    out(`  EP 0x${ep.toString(16)}: no data (rc=${n})\n`);
+  }
+} else if (action === "fwdl") {
+  // Full firmware download: parse fw+config, fragment via vendor 0xFC20, then HCI_Reset.
+  const { parseFirmware } = await import(new URL("./fw.ts", import.meta.url).href);
+  const rd = (n: string) => Deno.readFileSync(new URL("./" + n, import.meta.url).pathname);
+  if (!claim(0)) { out(`fwdl: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+
+  // 1. rom_version (0xFC6D) to pick the patch.
+  hciCmd(0x3f, 0x06d);
+  const rv = new Uint8Array(64);
+  if (bulk(0x81, rv, 1500) < 7 || rv[0] !== 0x0e) { out("fwdl: rom_version read failed\n"); Deno.exit(1); }
+  const romVersion = rv[6];
+  out(`fwdl: rom_version=0x${h(romVersion)}\n`);
+
+  // 2. parse.
+  const plan = parseFirmware(rd("rtl8761bu_fw.bin"), rd("rtl8761bu_config.bin"), romVersion);
+  const pl: Uint8Array = plan.payload;
+  out(`fwdl: patch chip_id=${plan.chosen.chipId} payload=${pl.length}B\n`);
+
+  // 3. fragment + download. vendor 0xFC20, param = [index][<=252 data], bit7 on the last.
+  const CHUNK = 252;
+  const frags = Math.ceil(pl.length / CHUNK);
+  for (let i = 0; i < frags; i++) {
+    const slice = pl.subarray(i * CHUNK, i * CHUNK + CHUNK);
+    let idx = i & 0x7f;
+    if (i === frags - 1) idx |= 0x80;
+    const param = new Uint8Array(1 + slice.length);
+    param[0] = idx;
+    param.set(slice, 1);
+    const sent = hciCmd(0x3f, 0x020, param);
+    const ev = new Uint8Array(64);
+    const n = bulk(0x81, ev, 2000);
+    const ok = n >= 7 && ev[0] === 0x0e && ev[3] === 0x20 && ev[4] === 0xfc && ev[5] === 0x00;
+    if (!ok) { out(`  frag ${i}/${frags} FAILED sent=${sent} n=${n} ev=${hex(ev, Math.max(0, n))}\n`); Deno.exit(1); }
+    if (i % 20 === 0 || i === frags - 1) out(`  frag ${i + 1}/${frags} ok (idx=0x${h(idx)})\n`);
+  }
+
+  // 4. HCI_Reset (0x0C03) and let the patched fw relaunch.
+  hciCmd(0x03, 0x003);
+  bulk(0x81, new Uint8Array(64), 2000);
+  await new Promise((r) => setTimeout(r, 300));
+
+  // 5. Re-read local version — subversion should differ once the patch runs.
+  hciCmd(0x04, 0x0001);
+  const lv = new Uint8Array(64);
+  const ln = bulk(0x81, lv, 1500);
+  if (ln >= 14 && lv[0] === 0x0e) {
+    const subver = lv[12] | (lv[13] << 8);
+    out(`fwdl: DONE. post-patch lmp_subver=0x${subver.toString(16)} (rom was 0x8761)\n`);
+  } else {
+    out(`fwdl: download sent; version re-read inconclusive (n=${ln})\n`);
+  }
+} else if (action === "scan") {
+  // LE active scan. Self-contained: downloads fw first if the chip is still in ROM.
+  if (!claim(0)) { out(`scan: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  const sv = await ensurePatched();
+  out(`scan: controller lmp_subver=0x${(sv >>> 0).toString(16)}${sv === 0x8761 ? " (STILL ROM!)" : " (patched)"}\n`);
+  const ff = new Uint8Array(8).fill(0xff);
+  // Unmask events: general Set_Event_Mask must include LE Meta (bit 61) or adv reports never arrive.
+  const em = cmdC(0x03, 0x001, ff);           // Set_Event_Mask
+  const lem = cmdC(0x08, 0x001, ff);          // LE_Set_Event_Mask
+  // LE_Set_Scan_Parameters: active, interval/window 0x0010, own=public, filter=all.
+  const sp = cmdC(0x08, 0x00b, Uint8Array.from([0x01, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00]));
+  // LE_Set_Scan_Enable: enable=1, filter_duplicates=0.
+  const se = cmdC(0x08, 0x00c, Uint8Array.from([0x01, 0x00]));
+  out(`scan: event_mask=${em.status} le_event_mask=${lem.status} set_params=${sp.status} set_enable=${se.status}\n`);
+  let rawEvents = 0;
+
+  const secs = Number(Deno.env.get("BT_SCAN_SECS") ?? "5");
+  out(`scan: listening ${secs}s...\n`);
+  const seen = new Map<string, { rssi: number; name: string }>();
+  const t0 = Date.now();
+  while (Date.now() - t0 < secs * 1000) {
+    const ev = new Uint8Array(260);
+    const n = bulk(0x81, ev, 800);
+    if (n > 0) rawEvents++;
+    if (n < 4 || ev[0] !== 0x3e || ev[2] !== 0x02) continue;      // LE Meta / Adv Report
+    let p = 3;
+    const num = ev[p++];
+    for (let r = 0; r < num && p + 9 <= n; r++) {
+      p++;                                                        // event_type
+      p++;                                                        // address_type
+      const mac = Array.from(ev.subarray(p, p + 6)).reverse().map(h).join(":"); p += 6;
+      const dlen = ev[p++];
+      let name = "";
+      const adEnd = p + dlen;
+      let q = p;
+      while (q + 2 <= adEnd) {                                    // parse AD structures for name
+        const l = ev[q], t = ev[q + 1];
+        if (l === 0) break;
+        if ((t === 0x09 || t === 0x08) && l > 1) name = new TextDecoder().decode(ev.subarray(q + 2, q + 1 + l));
+        q += l + 1;
+      }
+      p = adEnd;
+      const rssi = ev[p] > 127 ? ev[p] - 256 : ev[p]; p++;        // signed
+      const prev = seen.get(mac);
+      seen.set(mac, { rssi, name: name || prev?.name || "" });
+    }
+  }
+  hciCmd(0x08, 0x00c, Uint8Array.from([0x00, 0x00]));             // LE_Set_Scan_Enable off
+  const rows = [...seen.entries()].sort((a, b) => b[1].rssi - a[1].rssi);
+  out(`scan: ${rows.length} device(s) (${rawEvents} raw events)\n`);
+  for (const [mac, v] of rows) out(`  ${mac}  ${String(v.rssi).padStart(4)} dBm  ${v.name}\n`);
+} else if (action === "romver") {
+  // Read ROM Version: vendor OGF=0x3f, OCF=0x06d (opcode 0xFC6D). Selects the fw patch.
+  if (!claim(0)) { out(`romver: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  const sent = hciCmd(0x3f, 0x06d);
+  out(`romver: Read_ROM_Version sent rc=${sent}\n`);
+  const ev = new Uint8Array(64);
+  const n = bulk(0x81, ev, 1500);
+  if (n <= 0) { out(`  no event (rc=${n})\n`); Deno.exit(1); }
+  out(`  event: ${hex(ev, n)}\n`);
+  // 0e len ncmd op_lo op_hi status rom_version
+  if (n >= 7 && ev[0] === 0x0e) out(`  status=${h(ev[5])} rom_version=0x${h(ev[6])}\n`);
+} else {
+  out(`unknown action: ${action}\n`);
+  Deno.exit(2);
+}
