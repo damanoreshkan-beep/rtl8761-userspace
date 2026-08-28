@@ -155,17 +155,25 @@ Bugs fixed along the way:
     received one notification/second with the value incrementing 0x3d→…** live. On unsubscribe
     writes CCCD = 0x0000.
 
+11. **Characteristic writes — DONE (green end-to-end).** `write`: connect → discover → pick a
+    writable char (auto: prefers readable + well-known 16-bit UUIDs, skips Client Supported
+    Features 0x2b29; or `BT_WRITE_UUID`) → `Write_Request` (0x12, ack) if the char has the
+    Write prop, else `Write_Command` (0x52, no response) for WriteWithoutResponse → read back
+    if readable to verify. `BT_WRITE_HEX=deadbeef`. Verified vs the box: wrote `ca fe 01` to a
+    custom read/write echo char (0xabcd) → Write Response ok → **read-back matched**.
+
 v1 = milestones 1–6 (BLE sniffer) DONE. Advertise (7), Connect+discovery (8), Read chars (9),
-Notifications (10) DONE. Working no-root BLE central: scan / advertise / connect / discover /
-read / subscribe. Next: characteristic writes (Write_Request 0x12 / Write_Command 0x52), then
-a touch-TUI.
+Notifications (10), Writes (11) DONE. Complete no-root BLE central: scan / advertise / connect
+/ discover / read / subscribe / write. Next: a touch-TUI, or descriptor writes / bonding.
 
 ## Test rig — box as a BLE peripheral
 `ssh box` (Intel 8260, BlueZ). Two peers, both hold via a live process (advertisement drops
 when it exits): `/tmp/ble_adv.sh <secs>` = bluetoothctl connectable advertiser "mrx-ble" with
-the default GATT DB; `/tmp/gatt_hr.py <secs>` = python-dbus Heart Rate (0x180D/0x2A37) server
-that notifies every second once subscribed. Box BT addr F8:94:C2:4C:6F:7A (public). NB: box
-shell is zsh, no hciconfig — drive it with bluetoothctl / btmgmt.
+the default GATT DB; `/tmp/gatt_hr.py <secs>` = python-dbus server with a Heart Rate (0x180D/0x2A37) char that
+notifies every second once subscribed, plus an Echo char (0xABCD, read+write) that stores and
+returns whatever is written. Box BT addr F8:94:C2:4C:6F:7A (public). NB: box shell is zsh, no
+hciconfig — drive with bluetoothctl / btmgmt; use `/usr/sbin/ssh box` (see the ssh memory) and
+kill it with `pkill -f '[g]att_hr.py'` (bracket avoids self-match).
 
 ### Gotchas nailed (for the write-up)
 - fw does NOT survive a USB reset on callback close → each fresh termux-usb invocation is

@@ -331,6 +331,17 @@ function attWrite(handle: number, attHandle: number, value: Uint8Array): boolean
   const b = attTxn(handle, req, 0x13);
   return !!b && b[0] === 0x13;
 }
+function attWriteCmd(handle: number, attHandle: number, value: Uint8Array): boolean { // ATT Write Command 0x52 (no response)
+  const req = new Uint8Array(3 + value.length);
+  req[0] = 0x52; new DataView(req.buffer).setUint16(1, attHandle, true); req.set(value, 3);
+  return aclSend(handle, ATT_CID, req) > 0;
+}
+function parseHex(s: string): Uint8Array { // "de ad be" / "0xdeadbe" / "deadbe" -> bytes
+  const clean = s.replace(/0x/gi, "").replace(/[^0-9a-fA-F]/g, "");
+  const out = new Uint8Array(Math.floor(clean.length / 2));
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
+  return out;
+}
 const GATT_NAMES: Record<string, string> = {
   "0x2a00": "Device Name", "0x2a01": "Appearance", "0x2a04": "Pref Conn Params",
   "0x2a29": "Manufacturer", "0x2a24": "Model Number", "0x2a25": "Serial Number",
@@ -564,6 +575,38 @@ if (action === "desc") {
     }
   }
   out(`read: done. disconnecting.\n`);
+  disconnect(handle);
+} else if (action === "write") {
+  // Connect, find a writable characteristic, write BT_WRITE_HEX, read back if readable.
+  if (!claim(0)) { out(`write: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  const handle = await connectTarget("write");
+  if (handle < 0) Deno.exit(1);
+  const svcs = discoverServices(handle);
+  const wantUuid = (Deno.env.get("BT_WRITE_UUID") ?? "").toLowerCase();
+  const value = parseHex(Deno.env.get("BT_WRITE_HEX") ?? "01");
+  // gather writable chars (0x08 Write | 0x04 WriteWithoutResponse); prefer readable (verifiable),
+  // skip Client Supported Features (0x2b29) in auto mode.
+  const cands: { c: Char; score: number }[] = [];
+  for (const s of svcs) for (const c of discoverChars(handle, s.start, s.end)) {
+    if (!(c.props & 0x0c)) continue;
+    if (wantUuid && c.uuid.toLowerCase() !== wantUuid) continue;
+    cands.push({ c, score: (c.props & 0x02 ? 2 : 0) + (c.uuid === "0x2b29" ? 0 : 1) + (c.uuid.startsWith("0x") ? 1 : 0) });
+  }
+  const chosen = cands.sort((a, b) => b.score - a.score)[0]?.c;
+  if (!chosen) { out(`write: no writable characteristic found\n`); disconnect(handle); Deno.exit(1); }
+  const withResp = !!(chosen.props & 0x08);
+  out(`write: char ${chosen.uuid} h=0x${chosen.valueHandle.toString(16)} mode=${withResp ? "req(0x12)" : "cmd(0x52)"}\n`);
+  out(`write: value = ${Array.from(value).map(h).join(" ")}\n`);
+  const ok = withResp ? attWrite(handle, chosen.valueHandle, value) : attWriteCmd(handle, chosen.valueHandle, value);
+  out(`write: ${ok ? "ok" : "FAILED"}\n`);
+  if (chosen.props & 0x02) {
+    const raw = readChar(handle, chosen.valueHandle);
+    if (raw) {
+      const asc = Array.from(raw).map((x) => x >= 0x20 && x < 0x7f ? String.fromCharCode(x) : ".").join("");
+      const match = raw.length === value.length && raw.every((b, i) => b === value[i]);
+      out(`write: read-back = ${Array.from(raw).map(h).join(" ")}  "${asc}"  ${match ? "MATCH ✓" : "(differs)"}\n`);
+    }
+  }
   disconnect(handle);
 } else if (action === "notify") {
   // Connect, subscribe to a notify/indicate characteristic's CCCD, stream notifications.
