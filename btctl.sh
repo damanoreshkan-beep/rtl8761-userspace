@@ -9,6 +9,7 @@
 #   btctl scan   <dev>   # LE active scan (auto-downloads fw first). BT_SCAN_SECS=5
 #   btctl adv    <dev>   # LE advertise as a named device. BT_ADV_NAME, BT_ADV_SECS=20
 #   btctl connect <dev>  # LE connect + GATT primary services. BT_TARGET=<mac>, BT_SCAN_SECS
+#   btctl read   <dev>   # LE connect + discover characteristics + read readable values
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DENO="${DENO:-/root/.deno/bin/deno}"
@@ -39,5 +40,6 @@ case "$cmd" in
   scan)   run scan   "$1" ;;
   adv)    run adv    "$1" ;;
   connect) run connect "$1" ;;
+  read)   run read   "$1" ;;
   *)     echo "unknown: $cmd"; exit 2 ;;
 esac

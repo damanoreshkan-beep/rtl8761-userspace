@@ -208,6 +208,109 @@ function scanCollect(secs: number): Map<string, AdvRec> {
   cmdC(0x08, 0x00c, Uint8Array.from([0x00, 0x00]));                               // scan disable
   return seen;
 }
+
+// Ensure patched, scan, pick target (BT_TARGET or strongest connectable), create the LE
+// connection and exchange MTU. Returns the connection handle or -1. `label` prefixes output.
+async function connectTarget(label: string): Promise<number> {
+  const sv = await ensurePatched();
+  out(`${label}: controller lmp_subver=0x${(sv >>> 0).toString(16)}\n`);
+  const want = (Deno.env.get("BT_TARGET") ?? "").toLowerCase();
+  const recs = scanCollect(Number(Deno.env.get("BT_SCAN_SECS") ?? "5"));
+  const connectable = [...recs.entries()].filter(([, r]) => r.eventType === 0x00 || r.eventType === 0x01);
+  const target = want ? recs.get(want) : connectable.sort((a, b) => b[1].rssi - a[1].rssi)[0]?.[1];
+  out(`${label}: ${recs.size} seen, ${connectable.length} connectable\n`);
+  for (const [mac, r] of connectable.sort((a, b) => b[1].rssi - a[1].rssi).slice(0, 6))
+    out(`  ${mac}  type=${r.addrType}  ${String(r.rssi).padStart(4)} dBm  ${r.name}\n`);
+  if (!target) { out(`${label}: no connectable target${want ? " matching " + want : ""}\n`); return -1; }
+  out(`${label}: -> ${Array.from(target.addr).reverse().map(h).join(":")} (addr_type=${target.addrType})\n`);
+  const cc = new Uint8Array(25);
+  const dv = new DataView(cc.buffer);
+  dv.setUint16(0, 0x0060, true); dv.setUint16(2, 0x0060, true); // scan interval/window
+  cc[4] = 0x00; cc[5] = target.addrType; cc.set(target.addr, 6); cc[12] = 0x00;
+  dv.setUint16(13, 0x0018, true); dv.setUint16(15, 0x0028, true); // conn interval min/max
+  dv.setUint16(17, 0x0000, true); dv.setUint16(19, 0x00c8, true); // latency, supervision (2s)
+  dv.setUint16(21, 0x0000, true); dv.setUint16(23, 0x0000, true); // CE length
+  const cst = cmdStatus(0x08, 0x00d, cc);
+  out(`${label}: create_connection status=${cst}\n`);
+  const ce = waitMeta([0x01, 0x0a], 8000);                        // LE (Enhanced) Connection Complete
+  if (ce.length < 6 || ce[3] !== 0x00) {
+    out(`${label}: connection FAILED (meta status=${ce.length >= 4 ? "0x" + h(ce[3]) : "timeout"})\n`);
+    cmdStatus(0x08, 0x00e); return -1;                            // LE_Create_Connection_Cancel
+  }
+  const handle = ce[4] | (ce[5] << 8);
+  out(`${label}: CONNECTED handle=0x${handle.toString(16)}\n`);
+  aclSend(handle, ATT_CID, Uint8Array.from([0x02, 0x17, 0x00])); // Exchange MTU (default 23)
+  const mtu = attRecv(2000);
+  if (mtu && mtu[0] === 0x03) out(`${label}: server MTU=${mtu[1] | (mtu[2] << 8)}\n`);
+  return handle;
+}
+function disconnect(handle: number) {
+  cmdStatus(0x01, 0x006, Uint8Array.from([handle & 0xff, (handle >> 8) & 0xff, 0x13]));
+}
+// One ATT request expecting response opcode `want` (or an Error Response 0x01); skips strays.
+function attTxn(handle: number, req: Uint8Array, want: number): Uint8Array | null {
+  aclSend(handle, ATT_CID, req);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 3500) {
+    const p = attRecv(1000);
+    if (p && (p[0] === want || p[0] === 0x01)) return p;
+  }
+  return null;
+}
+const attUuid = (uv: Uint8Array) =>
+  uv.length === 2 ? "0x" + (uv[0] | (uv[1] << 8)).toString(16).padStart(4, "0") : Array.from(uv).reverse().map(h).join("");
+
+interface Svc { start: number; end: number; uuid: string }
+function discoverServices(handle: number): Svc[] {   // Read_By_Group_Type, Primary Service 0x2800
+  const svcs: Svc[] = [];
+  let start = 0x0001;
+  while (start <= 0xffff) {
+    const req = new Uint8Array(7); const rv = new DataView(req.buffer);
+    req[0] = 0x10; rv.setUint16(1, start, true); rv.setUint16(3, 0xffff, true); rv.setUint16(5, 0x2800, true);
+    const b = attTxn(handle, req, 0x11);
+    if (!b || b[0] !== 0x11) break;
+    const each = b[1]; let last = 0;
+    for (let i = 2; i + each <= b.length; i += each) {
+      const s = b[i] | (b[i + 1] << 8), e = b[i + 2] | (b[i + 3] << 8);
+      svcs.push({ start: s, end: e, uuid: attUuid(b.subarray(i + 4, i + each)) }); last = e;
+    }
+    if (last >= 0xffff || last < start) break;
+    start = last + 1;
+  }
+  return svcs;
+}
+interface Char { props: number; valueHandle: number; uuid: string }
+function discoverChars(handle: number, sStart: number, sEnd: number): Char[] { // Read_By_Type, Char Decl 0x2803
+  const chars: Char[] = [];
+  let start = sStart;
+  while (start <= sEnd) {
+    const req = new Uint8Array(7); const rv = new DataView(req.buffer);
+    req[0] = 0x08; rv.setUint16(1, start, true); rv.setUint16(3, sEnd, true); rv.setUint16(5, 0x2803, true);
+    const b = attTxn(handle, req, 0x09);
+    if (!b || b[0] !== 0x09) break;
+    const each = b[1]; let last = 0;
+    for (let i = 2; i + each <= b.length; i += each) {
+      const declHandle = b[i] | (b[i + 1] << 8);
+      chars.push({ props: b[i + 2], valueHandle: b[i + 3] | (b[i + 4] << 8), uuid: attUuid(b.subarray(i + 5, i + each)) });
+      last = declHandle;
+    }
+    if (last >= sEnd || last < start) break;
+    start = last + 1;
+  }
+  return chars;
+}
+function readChar(handle: number, valueHandle: number): Uint8Array | null { // ATT Read Request 0x0a
+  const req = new Uint8Array(3);
+  req[0] = 0x0a; new DataView(req.buffer).setUint16(1, valueHandle, true);
+  const b = attTxn(handle, req, 0x0b);
+  return b && b[0] === 0x0b ? b.subarray(1) : null;
+}
+const GATT_NAMES: Record<string, string> = {
+  "0x2a00": "Device Name", "0x2a01": "Appearance", "0x2a04": "Pref Conn Params",
+  "0x2a29": "Manufacturer", "0x2a24": "Model Number", "0x2a25": "Serial Number",
+  "0x2a26": "Firmware Rev", "0x2a27": "Hardware Rev", "0x2a28": "Software Rev",
+  "0x2a19": "Battery Level", "0x2a23": "System ID", "0x2a50": "PnP ID",
+};
 const hex = (b: Uint8Array, n = b.length) =>
   Array.from(b.subarray(0, n)).map((x) => x.toString(16).padStart(2, "0")).join(" ");
 
@@ -405,84 +508,37 @@ if (action === "desc") {
 } else if (action === "connect") {
   // LE connect + GATT primary service discovery. Self-contained (downloads fw if needed).
   if (!claim(0)) { out(`connect: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
-  const sv = await ensurePatched();
-  out(`connect: controller lmp_subver=0x${(sv >>> 0).toString(16)}\n`);
-
-  // 1. scan to find a connectable target (event_type 0=ADV_IND, 1=ADV_DIRECT_IND).
-  const want = (Deno.env.get("BT_TARGET") ?? "").toLowerCase();
-  const recs = scanCollect(Number(Deno.env.get("BT_SCAN_SECS") ?? "5"));
-  const connectable = [...recs.entries()].filter(([, r]) => r.eventType === 0x00 || r.eventType === 0x01);
-  let target: AdvRec | undefined;
-  if (want) target = recs.get(want);
-  else target = connectable.sort((a, b) => b[1].rssi - a[1].rssi)[0]?.[1];
-  out(`connect: ${recs.size} seen, ${connectable.length} connectable\n`);
-  for (const [mac, r] of connectable.sort((a, b) => b[1].rssi - a[1].rssi).slice(0, 6)) {
-    out(`  ${mac}  type=${r.addrType}  ${String(r.rssi).padStart(4)} dBm  ${r.name}\n`);
-  }
-  if (!target) { out(`connect: no connectable target${want ? " matching " + want : ""}\n`); Deno.exit(1); }
-  const tmac = Array.from(target.addr).reverse().map(h).join(":");
-  out(`connect: -> ${tmac} (addr_type=${target.addrType})\n`);
-
-  // 2. LE_Create_Connection.
-  const cc = new Uint8Array(25);
-  const dv = new DataView(cc.buffer);
-  dv.setUint16(0, 0x0060, true); dv.setUint16(2, 0x0060, true); // scan interval/window
-  cc[4] = 0x00;                                                 // initiator filter: use peer addr
-  cc[5] = target.addrType;                                      // peer addr type
-  cc.set(target.addr, 6);                                       // peer addr (LE, as received)
-  cc[12] = 0x00;                                                // own addr type: public
-  dv.setUint16(13, 0x0018, true); dv.setUint16(15, 0x0028, true); // conn interval min/max
-  dv.setUint16(17, 0x0000, true);                              // latency
-  dv.setUint16(19, 0x00c8, true);                              // supervision timeout (2s)
-  dv.setUint16(21, 0x0000, true); dv.setUint16(23, 0x0000, true); // min/max CE length
-  const cst = cmdStatus(0x08, 0x00d, cc);
-  out(`connect: create_connection status=${cst}\n`);
-  const ce = waitMeta([0x01, 0x0a], 8000);                     // LE (Enhanced) Connection Complete
-  if (ce.length < 6 || ce[3] !== 0x00) {
-    out(`connect: connection FAILED (meta status=${ce.length >= 4 ? "0x" + h(ce[3]) : "timeout"})\n`);
-    cmdStatus(0x08, 0x00e); Deno.exit(1);                      // LE_Create_Connection_Cancel
-  }
-  const handle = ce[4] | (ce[5] << 8);
-  out(`connect: CONNECTED handle=0x${handle.toString(16)}\n`);
-
-  // 3. ATT Exchange MTU (0x02), then discover primary services (Read By Group Type 0x2800).
-  aclSend(handle, ATT_CID, Uint8Array.from([0x02, 0x17, 0x00])); // client rx MTU 23
-  const mtu = attRecv(2000);
-  if (mtu && mtu[0] === 0x03) out(`connect: server MTU=${mtu[1] | (mtu[2] << 8)}\n`);
-
+  const handle = await connectTarget("connect");
+  if (handle < 0) Deno.exit(1);
   out(`connect: primary services:\n`);
-  let start = 0x0001, found = 0;
-  while (start <= 0xffff) {
-    const req = new Uint8Array(7);
-    const rv = new DataView(req.buffer);
-    req[0] = 0x10; rv.setUint16(1, start, true); rv.setUint16(3, 0xffff, true); rv.setUint16(5, 0x2800, true);
-    aclSend(handle, ATT_CID, req);
-    // read until the matching response, skipping strays (e.g. a late MTU 0x03) and retrying
-    let b: Uint8Array | null = null;
-    const t0 = Date.now();
-    while (Date.now() - t0 < 3500) {
-      const p = attRecv(1000);
-      if (p && (p[0] === 0x11 || p[0] === 0x01)) { b = p; break; }
+  const svcs = discoverServices(handle);
+  for (const s of svcs) out(`  [0x${s.start.toString(16).padStart(4, "0")}-0x${s.end.toString(16).padStart(4, "0")}] ${s.uuid}\n`);
+  out(`connect: ${svcs.length} service(s). disconnecting.\n`);
+  disconnect(handle);
+} else if (action === "read") {
+  // Connect, then for every service discover characteristics and read the readable ones.
+  if (!claim(0)) { out(`read: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  const handle = await connectTarget("read");
+  if (handle < 0) Deno.exit(1);
+  const svcs = discoverServices(handle);
+  out(`read: ${svcs.length} service(s); characteristics + values:\n`);
+  for (const s of svcs) {
+    out(`  service ${s.uuid} [0x${s.start.toString(16).padStart(4, "0")}-0x${s.end.toString(16).padStart(4, "0")}]\n`);
+    for (const c of discoverChars(handle, s.start, s.end)) {
+      const flags = (c.props & 0x02 ? "R" : "-") + (c.props & 0x0c ? "W" : "-") + (c.props & 0x10 ? "N" : "-") + (c.props & 0x20 ? "I" : "-");
+      let val = "";
+      if (c.props & 0x02) {
+        const raw = readChar(handle, c.valueHandle);
+        if (raw) {
+          const asc = Array.from(raw).map((x) => x >= 0x20 && x < 0x7f ? String.fromCharCode(x) : ".").join("");
+          val = `= ${Array.from(raw).map(h).join(" ")}  "${asc}"`;
+        } else val = "= <read denied>";
+      }
+      out(`    ${c.uuid} h=0x${c.valueHandle.toString(16).padStart(4, "0")} [${flags}] ${(GATT_NAMES[c.uuid] ?? "").padEnd(16)} ${val}\n`);
     }
-    if (!b) { out(`  (no response)\n`); break; }
-    if (b[0] === 0x01) break;                                  // Error Response -> discovery done
-    const each = b[1];
-    let last = 0;
-    for (let i = 2; i + each <= b.length; i += each) {
-      const hnd = b[i] | (b[i + 1] << 8);
-      const end = b[i + 2] | (b[i + 3] << 8);
-      const uv = b.subarray(i + 4, i + each);
-      const uuid = uv.length === 2
-        ? "0x" + (uv[0] | (uv[1] << 8)).toString(16).padStart(4, "0")
-        : Array.from(uv).reverse().map(h).join("");
-      out(`  [0x${hnd.toString(16).padStart(4, "0")}-0x${end.toString(16).padStart(4, "0")}] ${uuid}\n`);
-      last = end; found++;
-    }
-    if (last >= 0xffff || last < start) break;
-    start = last + 1;
   }
-  out(`connect: ${found} service(s). disconnecting.\n`);
-  cmdStatus(0x01, 0x006, Uint8Array.from([handle & 0xff, (handle >> 8) & 0xff, 0x13])); // HCI Disconnect
+  out(`read: done. disconnecting.\n`);
+  disconnect(handle);
 } else if (action === "romver") {
   // Read ROM Version: vendor OGF=0x3f, OCF=0x06d (opcode 0xFC6D). Selects the fw patch.
   if (!claim(0)) { out(`romver: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }

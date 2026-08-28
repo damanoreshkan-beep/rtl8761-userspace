@@ -138,9 +138,18 @@ Bugs fixed along the way:
   arrive on the same bulk EP; `attRecv` keeps only CID 0x0004, and discovery retries until
   it sees the matching 0x11/0x01.
 
-v1 = milestones 1–6 (BLE sniffer) DONE. Advertise (7) DONE. Connect + GATT discovery (8)
-DONE. This is a working no-root BLE central: scan / advertise / connect / discover.
-Next: read a characteristic value (Read_By_Type + Read), then notifications.
+9. **Read characteristics — DONE (green end-to-end).** `read`: connect → discover services
+   → per service `Read_By_Type` (Char Declaration 0x2803) for characteristics → ATT
+   `Read_Request` (0x0a) on each readable (props bit 0x02) value handle. Verified vs the box:
+   read GAP Device Name = **"mrx-arch"**, Appearance 0x010c, GATT Database Hash, DevInfo
+   PnP ID; a custom RWN characteristic correctly reported `<read denied>` (ATT error, needs
+   encryption). Flags R/W/N/I parsed from the declaration; well-known UUIDs named; values as
+   hex + ASCII. connect/read share `connectTarget` + `discoverServices` helpers.
+
+v1 = milestones 1–6 (BLE sniffer) DONE. Advertise (7), Connect+discovery (8), Read chars (9)
+DONE. Working no-root BLE central: scan / advertise / connect / discover / read.
+Next: subscribe to notifications (write CCCD 0x2902 = 0x0001, stream Handle Value
+Notifications 0x1b), then characteristic writes.
 
 ### Gotchas nailed (for the write-up)
 - fw does NOT survive a USB reset on callback close → each fresh termux-usb invocation is
