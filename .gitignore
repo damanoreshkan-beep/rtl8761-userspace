@@ -4,4 +4,5 @@
 .cb.sh
 # logs / scratch
 *.log
+*.out
 out*.txt

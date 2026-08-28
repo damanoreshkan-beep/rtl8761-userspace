@@ -8,6 +8,7 @@
 #   btctl fwdl   <dev>   # download rtl8761bu fw+config, HCI_Reset, verify patched subver
 #   btctl scan   <dev>   # LE active scan (auto-downloads fw first). BT_SCAN_SECS=5
 #   btctl adv    <dev>   # LE advertise as a named device. BT_ADV_NAME, BT_ADV_SECS=20
+#   btctl connect <dev>  # LE connect + GATT primary services. BT_TARGET=<mac>, BT_SCAN_SECS
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DENO="${DENO:-/root/.deno/bin/deno}"
@@ -17,9 +18,12 @@ export PATH="/data/data/com.termux/files/usr/bin:$PATH"
 run() { # action dev
   local action="$1" dev="$2"
   local cb="$HERE/.cb.sh"
+  # NB: termux-usb only forwards the callback's stdout when it exits 0, so never let the
+  # deno exit code propagate — the driver's output IS the result.
   cat > "$cb" <<EOF
 #!/data/data/com.termux/files/usr/bin/bash
 HOME=/root BT_ACTION="$action" "$DENO" run -A --no-lock "$CORE" "\$1"
+exit 0
 EOF
   chmod +x "$cb"
   timeout 60 termux-usb -r -e "$cb" "$dev"
@@ -34,5 +38,6 @@ case "$cmd" in
   fwdl)   run fwdl   "$1" ;;
   scan)   run scan   "$1" ;;
   adv)    run adv    "$1" ;;
+  connect) run connect "$1" ;;
   *)     echo "unknown: $cmd"; exit 2 ;;
 esac

@@ -118,7 +118,23 @@ fetch at setup, gitignore the .bin (same rule as ax56 fw).
    all status 0, broadcasts a named device. verify: seen from a phone BLE scanner
    (single radio can't self-verify; pending visual confirmation). (`btctl adv`)
 
-v1 = milestones 1–6 (a working BLE sniffer) — DONE. Advertise implemented (7). Connect next.
+8. **LE connect + GATT — IMPLEMENTED, live verify pending a cooperative peer.**
+   `connect`: scan → pick a connectable advertiser (event_type 0/1) or `BT_TARGET=<mac>` →
+   `LE_Create_Connection` → wait `LE_Connection_Complete` (0x3e/0x01) → over ACL (bulk
+   0x02/0x82, L2CAP CID 0x0004) ATT `Exchange_MTU` then `Read_By_Group_Type` (0x2800) loop
+   for primary services → `HCI_Disconnect`. VERIFIED so far: scan/filter, and
+   `LE_Create_Connection` accepted with **Command Status 0**. Not yet completed end-to-end:
+   the RF environment has only non-connectable beacons + phone/watch RPAs (addr top bits
+   01 = resolvable-private) that reject anonymous centrals; the named GR-AC appliance is
+   ADV_SCAN_IND (scannable, not connectable when idle). Need a peripheral that accepts a
+   connection (nRF Connect connectable advertiser, a HR strap, a smart bulb in pairing).
+
+Bugs fixed along the way (both HCI event-parse offsets): (a) `cmdStatus` reads status at
+ev[2] (num_cmd is ev[3]); (b) termux-usb forwards callback stdout ONLY on exit 0 — btctl's
+callback now always `exit 0` so a Deno.exit(1) never swallows the driver's output.
+
+v1 = milestones 1–6 (BLE sniffer) DONE. Advertise (7) implemented. Connect (8) implemented,
+one cooperative peer away from a green end-to-end GATT read.
 
 ### Gotchas nailed (for the write-up)
 - fw does NOT survive a USB reset on callback close → each fresh termux-usb invocation is

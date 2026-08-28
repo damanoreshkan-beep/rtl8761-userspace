@@ -59,6 +59,10 @@ function bulk(ep: number, buf: Uint8Array, timeout = 2000): number {
 const enc = new TextEncoder();
 const out = (s: string) => Deno.stdout.writeSync(enc.encode(s));
 
+// termux-usb forwards only the callback's stdout, so surface any throw there (not stderr).
+globalThis.addEventListener("unhandledrejection", (e) => { out(`ERROR: ${(e.reason as Error)?.stack ?? e.reason}\n`); Deno.exit(1); });
+globalThis.addEventListener("error", (e) => { out(`ERROR: ${e.error?.stack ?? e.message}\n`); Deno.exit(1); });
+
 // --- HCI helpers (defined here so both fwdl and scan can ensure a patched controller) ---
 function readEvent(timeout = 1500): Uint8Array {
   const ev = new Uint8Array(260);
@@ -107,6 +111,92 @@ async function ensurePatched(): Promise<number> {
   await new Promise((r) => setTimeout(r, 300));
   sv = localSubver();
   return sv;
+}
+// commands that return Command Status (0x0f) instead of Command Complete (e.g. Create_Connection)
+function cmdStatus(ogf: number, ocf: number, params?: Uint8Array): number {
+  const opcode = (ogf << 10) | ocf;
+  const lo = opcode & 0xff, hi = (opcode >> 8) & 0xff;
+  hciCmd(ogf, ocf, params);
+  for (let t = 0; t < 12; t++) {
+    const ev = readEvent(1500);
+    if (ev.length === 0) break;
+    // Command Status: 0x0f, len, status(ev[2]), num_cmd(ev[3]), opcode(ev[4..5])
+    if (ev[0] === 0x0f && ev.length >= 6 && ev[4] === lo && ev[5] === hi) return ev[2];
+  }
+  return -1;
+}
+// wait for an LE Meta event (0x3e) with a given subevent code; returns its bytes
+function waitMeta(sub: number, timeoutMs: number): Uint8Array {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const ev = readEvent(500);
+    if (ev.length >= 3 && ev[0] === 0x3e && ev[2] === sub) return ev;
+  }
+  return new Uint8Array(0);
+}
+// ACL data out on bulk EP 0x02: L2CAP PDU on the given CID over the connection handle.
+const PB_START = 0x00; // first fragment, host->controller (LE)
+function aclSend(handle: number, cid: number, payload: Uint8Array): number {
+  const hf = (handle & 0x0fff) | (PB_START << 12);
+  const l2 = 4 + payload.length;
+  const pkt = new Uint8Array(4 + 4 + payload.length);
+  const dv = new DataView(pkt.buffer);
+  dv.setUint16(0, hf, true);
+  dv.setUint16(2, l2, true);            // ACL data total length
+  dv.setUint16(4, payload.length, true); // L2CAP PDU length
+  dv.setUint16(6, cid, true);            // L2CAP CID
+  pkt.set(payload, 8);
+  return bulk(0x02, pkt, 2000);
+}
+// ACL data in on bulk EP 0x82: returns the L2CAP payload (strips ACL+L2CAP headers)
+function aclRecv(timeout = 2000): { cid: number; payload: Uint8Array } | null {
+  const buf = new Uint8Array(300);
+  const n = bulk(0x82, buf, timeout);
+  if (n < 8) return null;
+  const dv = new DataView(buf.buffer);
+  const l2len = dv.getUint16(4, true);
+  const cid = dv.getUint16(6, true);
+  return { cid, payload: buf.subarray(8, 8 + l2len) };
+}
+const ATT_CID = 0x0004;
+
+interface AdvRec { addr: Uint8Array; addrType: number; eventType: number; rssi: number; name: string }
+// Run an LE active scan for `secs` and return records keyed by MAC (assumes patched + claimed).
+function scanCollect(secs: number): Map<string, AdvRec> {
+  const ff = new Uint8Array(8).fill(0xff);
+  cmdC(0x03, 0x001, ff); cmdC(0x08, 0x001, ff);                                   // event masks
+  cmdC(0x08, 0x00b, Uint8Array.from([0x01, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00])); // scan params
+  cmdC(0x08, 0x00c, Uint8Array.from([0x01, 0x00]));                               // scan enable
+  const seen = new Map<string, AdvRec>();
+  const t0 = Date.now();
+  while (Date.now() - t0 < secs * 1000) {
+    const ev = new Uint8Array(260);
+    const n = bulk(0x81, ev, 800);
+    if (n < 4 || ev[0] !== 0x3e || ev[2] !== 0x02) continue;
+    let p = 3;
+    const num = ev[p++];
+    for (let r = 0; r < num && p + 9 <= n; r++) {
+      const eventType = ev[p++];
+      const addrType = ev[p++];
+      const addr = ev.slice(p, p + 6); p += 6;
+      const mac = Array.from(addr).reverse().map(h).join(":");
+      const dlen = ev[p++];
+      let name = "";
+      const adEnd = p + dlen; let q = p;
+      while (q + 2 <= adEnd) {
+        const l = ev[q], t = ev[q + 1];
+        if (l === 0) break;
+        if ((t === 0x09 || t === 0x08) && l > 1) name = new TextDecoder().decode(ev.subarray(q + 2, q + 1 + l));
+        q += l + 1;
+      }
+      p = adEnd;
+      const rssi = ev[p] > 127 ? ev[p] - 256 : ev[p]; p++;
+      const prev = seen.get(mac);
+      seen.set(mac, { addr, addrType, eventType, rssi, name: name || prev?.name || "" });
+    }
+  }
+  cmdC(0x08, 0x00c, Uint8Array.from([0x00, 0x00]));                               // scan disable
+  return seen;
 }
 const hex = (b: Uint8Array, n = b.length) =>
   Array.from(b.subarray(0, n)).map((x) => x.toString(16).padStart(2, "0")).join(" ");
@@ -302,6 +392,83 @@ if (action === "desc") {
   await new Promise((r) => setTimeout(r, secs * 1000));
   cmdC(0x08, 0x00a, Uint8Array.from([0x00]));                  // LE_Set_Advertise_Enable off
   out(`adv: stopped\n`);
+} else if (action === "connect") {
+  // LE connect + GATT primary service discovery. Self-contained (downloads fw if needed).
+  if (!claim(0)) { out(`connect: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  const sv = await ensurePatched();
+  out(`connect: controller lmp_subver=0x${(sv >>> 0).toString(16)}\n`);
+
+  // 1. scan to find a connectable target (event_type 0=ADV_IND, 1=ADV_DIRECT_IND).
+  const want = (Deno.env.get("BT_TARGET") ?? "").toLowerCase();
+  const recs = scanCollect(Number(Deno.env.get("BT_SCAN_SECS") ?? "5"));
+  const connectable = [...recs.entries()].filter(([, r]) => r.eventType === 0x00 || r.eventType === 0x01);
+  let target: AdvRec | undefined;
+  if (want) target = recs.get(want);
+  else target = connectable.sort((a, b) => b[1].rssi - a[1].rssi)[0]?.[1];
+  out(`connect: ${recs.size} seen, ${connectable.length} connectable\n`);
+  for (const [mac, r] of connectable.sort((a, b) => b[1].rssi - a[1].rssi).slice(0, 6)) {
+    out(`  ${mac}  type=${r.addrType}  ${String(r.rssi).padStart(4)} dBm  ${r.name}\n`);
+  }
+  if (!target) { out(`connect: no connectable target${want ? " matching " + want : ""}\n`); Deno.exit(1); }
+  const tmac = Array.from(target.addr).reverse().map(h).join(":");
+  out(`connect: -> ${tmac} (addr_type=${target.addrType})\n`);
+
+  // 2. LE_Create_Connection.
+  const cc = new Uint8Array(25);
+  const dv = new DataView(cc.buffer);
+  dv.setUint16(0, 0x0060, true); dv.setUint16(2, 0x0060, true); // scan interval/window
+  cc[4] = 0x00;                                                 // initiator filter: use peer addr
+  cc[5] = target.addrType;                                      // peer addr type
+  cc.set(target.addr, 6);                                       // peer addr (LE, as received)
+  cc[12] = 0x00;                                                // own addr type: public
+  dv.setUint16(13, 0x0018, true); dv.setUint16(15, 0x0028, true); // conn interval min/max
+  dv.setUint16(17, 0x0000, true);                              // latency
+  dv.setUint16(19, 0x00c8, true);                              // supervision timeout (2s)
+  dv.setUint16(21, 0x0000, true); dv.setUint16(23, 0x0000, true); // min/max CE length
+  const cst = cmdStatus(0x08, 0x00d, cc);
+  out(`connect: create_connection status=${cst}\n`);
+  const ce = waitMeta(0x01, 8000);                             // LE Connection Complete
+  if (ce.length < 6 || ce[3] !== 0x00) {
+    out(`connect: connection FAILED (meta status=${ce.length >= 4 ? "0x" + h(ce[3]) : "timeout"})\n`);
+    cmdStatus(0x08, 0x00e); Deno.exit(1);                      // LE_Create_Connection_Cancel
+  }
+  const handle = ce[4] | (ce[5] << 8);
+  out(`connect: CONNECTED handle=0x${handle.toString(16)}\n`);
+
+  // 3. ATT Exchange MTU (0x02), then discover primary services (Read By Group Type 0x2800).
+  aclSend(handle, ATT_CID, Uint8Array.from([0x02, 0x17, 0x00])); // client rx MTU 23
+  const mtuRsp = aclRecv(2000);
+  if (mtuRsp && mtuRsp.payload[0] === 0x03) out(`connect: server MTU=${mtuRsp.payload[1] | (mtuRsp.payload[2] << 8)}\n`);
+
+  out(`connect: primary services:\n`);
+  let start = 0x0001, found = 0;
+  while (start <= 0xffff) {
+    const req = new Uint8Array(7);
+    const rv = new DataView(req.buffer);
+    req[0] = 0x10; rv.setUint16(1, start, true); rv.setUint16(3, 0xffff, true); rv.setUint16(5, 0x2800, true);
+    aclSend(handle, ATT_CID, req);
+    const rsp = aclRecv(2500);
+    if (!rsp || rsp.payload.length === 0) { out(`  (no response)\n`); break; }
+    const b = rsp.payload;
+    if (b[0] === 0x01) break;                                  // Error Response -> discovery done
+    if (b[0] !== 0x11) { out(`  unexpected ATT opcode 0x${h(b[0])}\n`); break; }
+    const each = b[1];
+    let last = 0;
+    for (let i = 2; i + each <= b.length; i += each) {
+      const hnd = b[i] | (b[i + 1] << 8);
+      const end = b[i + 2] | (b[i + 3] << 8);
+      const uv = b.subarray(i + 4, i + each);
+      const uuid = uv.length === 2
+        ? "0x" + (uv[0] | (uv[1] << 8)).toString(16).padStart(4, "0")
+        : Array.from(uv).reverse().map(h).join("");
+      out(`  [0x${hnd.toString(16).padStart(4, "0")}-0x${end.toString(16).padStart(4, "0")}] ${uuid}\n`);
+      last = end; found++;
+    }
+    if (last >= 0xffff || last < start) break;
+    start = last + 1;
+  }
+  out(`connect: ${found} service(s). disconnecting.\n`);
+  cmdStatus(0x01, 0x006, Uint8Array.from([handle & 0xff, (handle >> 8) & 0xff, 0x13])); // HCI Disconnect
 } else if (action === "romver") {
   // Read ROM Version: vendor OGF=0x3f, OCF=0x06d (opcode 0xFC6D). Selects the fw patch.
   if (!claim(0)) { out(`romver: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
