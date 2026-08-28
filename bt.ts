@@ -125,12 +125,13 @@ function cmdStatus(ogf: number, ocf: number, params?: Uint8Array): number {
   }
   return -1;
 }
-// wait for an LE Meta event (0x3e) with a given subevent code; returns its bytes
-function waitMeta(sub: number, timeoutMs: number): Uint8Array {
+// wait for an LE Meta event (0x3e) with any of the given subevent codes; returns its bytes
+function waitMeta(subs: number | number[], timeoutMs: number): Uint8Array {
+  const set = Array.isArray(subs) ? subs : [subs];
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     const ev = readEvent(500);
-    if (ev.length >= 3 && ev[0] === 0x3e && ev[2] === sub) return ev;
+    if (ev.length >= 3 && ev[0] === 0x3e && set.includes(ev[2])) return ev;
   }
   return new Uint8Array(0);
 }
@@ -159,6 +160,15 @@ function aclRecv(timeout = 2000): { cid: number; payload: Uint8Array } | null {
   return { cid, payload: buf.subarray(8, 8 + l2len) };
 }
 const ATT_CID = 0x0004;
+// read the next ATT-channel (CID 0x0004) PDU, skipping L2CAP signaling / other CIDs
+function attRecv(timeout = 2500): Uint8Array | null {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeout) {
+    const r = aclRecv(600);
+    if (r && r.cid === ATT_CID && r.payload.length) return r.payload;
+  }
+  return null;
+}
 
 interface AdvRec { addr: Uint8Array; addrType: number; eventType: number; rssi: number; name: string }
 // Run an LE active scan for `secs` and return records keyed by MAC (assumes patched + claimed).
@@ -427,7 +437,7 @@ if (action === "desc") {
   dv.setUint16(21, 0x0000, true); dv.setUint16(23, 0x0000, true); // min/max CE length
   const cst = cmdStatus(0x08, 0x00d, cc);
   out(`connect: create_connection status=${cst}\n`);
-  const ce = waitMeta(0x01, 8000);                             // LE Connection Complete
+  const ce = waitMeta([0x01, 0x0a], 8000);                     // LE (Enhanced) Connection Complete
   if (ce.length < 6 || ce[3] !== 0x00) {
     out(`connect: connection FAILED (meta status=${ce.length >= 4 ? "0x" + h(ce[3]) : "timeout"})\n`);
     cmdStatus(0x08, 0x00e); Deno.exit(1);                      // LE_Create_Connection_Cancel
@@ -437,8 +447,8 @@ if (action === "desc") {
 
   // 3. ATT Exchange MTU (0x02), then discover primary services (Read By Group Type 0x2800).
   aclSend(handle, ATT_CID, Uint8Array.from([0x02, 0x17, 0x00])); // client rx MTU 23
-  const mtuRsp = aclRecv(2000);
-  if (mtuRsp && mtuRsp.payload[0] === 0x03) out(`connect: server MTU=${mtuRsp.payload[1] | (mtuRsp.payload[2] << 8)}\n`);
+  const mtu = attRecv(2000);
+  if (mtu && mtu[0] === 0x03) out(`connect: server MTU=${mtu[1] | (mtu[2] << 8)}\n`);
 
   out(`connect: primary services:\n`);
   let start = 0x0001, found = 0;
@@ -447,11 +457,15 @@ if (action === "desc") {
     const rv = new DataView(req.buffer);
     req[0] = 0x10; rv.setUint16(1, start, true); rv.setUint16(3, 0xffff, true); rv.setUint16(5, 0x2800, true);
     aclSend(handle, ATT_CID, req);
-    const rsp = aclRecv(2500);
-    if (!rsp || rsp.payload.length === 0) { out(`  (no response)\n`); break; }
-    const b = rsp.payload;
+    // read until the matching response, skipping strays (e.g. a late MTU 0x03) and retrying
+    let b: Uint8Array | null = null;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 3500) {
+      const p = attRecv(1000);
+      if (p && (p[0] === 0x11 || p[0] === 0x01)) { b = p; break; }
+    }
+    if (!b) { out(`  (no response)\n`); break; }
     if (b[0] === 0x01) break;                                  // Error Response -> discovery done
-    if (b[0] !== 0x11) { out(`  unexpected ATT opcode 0x${h(b[0])}\n`); break; }
     const each = b[1];
     let last = 0;
     for (let i = 2; i + each <= b.length; i += each) {

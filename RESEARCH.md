@@ -118,23 +118,29 @@ fetch at setup, gitignore the .bin (same rule as ax56 fw).
    all status 0, broadcasts a named device. verify: seen from a phone BLE scanner
    (single radio can't self-verify; pending visual confirmation). (`btctl adv`)
 
-8. **LE connect + GATT — IMPLEMENTED, live verify pending a cooperative peer.**
-   `connect`: scan → pick a connectable advertiser (event_type 0/1) or `BT_TARGET=<mac>` →
-   `LE_Create_Connection` → wait `LE_Connection_Complete` (0x3e/0x01) → over ACL (bulk
-   0x02/0x82, L2CAP CID 0x0004) ATT `Exchange_MTU` then `Read_By_Group_Type` (0x2800) loop
-   for primary services → `HCI_Disconnect`. VERIFIED so far: scan/filter, and
-   `LE_Create_Connection` accepted with **Command Status 0**. Not yet completed end-to-end:
-   the RF environment has only non-connectable beacons + phone/watch RPAs (addr top bits
-   01 = resolvable-private) that reject anonymous centrals; the named GR-AC appliance is
-   ADV_SCAN_IND (scannable, not connectable when idle). Need a peripheral that accepts a
-   connection (nRF Connect connectable advertiser, a HR strap, a smart bulb in pairing).
+8. **LE connect + GATT — DONE (green end-to-end).** `connect`: scan → pick a connectable
+   advertiser (event_type 0/1) or `BT_TARGET=<mac>` → `LE_Create_Connection` → wait
+   `LE_(Enhanced_)Connection_Complete` → over ACL (bulk 0x02/0x82, L2CAP CID 0x0004) ATT
+   `Exchange_MTU` then `Read_By_Group_Type` (0x2800) loop for primary services →
+   `HCI_Disconnect`. Verified against the Arch bench box (`ssh box`, Intel 8260) running a
+   BlueZ connectable peripheral "mrx-ble" (`bluetoothctl advertise peripheral`, held by a
+   backgrounded pipe): **CONNECTED handle=0x10, discovered GAP 0x1800, GATT 0x1801,
+   Device Information 0x180a, and a 128-bit custom service** with correct handle ranges.
 
-Bugs fixed along the way (both HCI event-parse offsets): (a) `cmdStatus` reads status at
-ev[2] (num_cmd is ev[3]); (b) termux-usb forwards callback stdout ONLY on exit 0 — btctl's
-callback now always `exit 0` so a Deno.exit(1) never swallows the driver's output.
+Bugs fixed along the way:
+- `cmdStatus` reads status at ev[2] (num_cmd is ev[3]).
+- termux-usb forwards callback stdout ONLY on exit 0 — btctl's callback now always
+  `exit 0`, and bt.ts surfaces throws to stdout (stderr is dropped).
+- BT 5.1 controller: enabling the full LE event mask switches Connection Complete to the
+  **Enhanced** form (0x3e/0x0a); `waitMeta` accepts both 0x01 and 0x0a (status/handle share
+  offsets ev[3]/ev[4..5]).
+- ATT read must skip strays: a late MTU-response (0x03) and L2CAP signaling on CID 0x0005
+  arrive on the same bulk EP; `attRecv` keeps only CID 0x0004, and discovery retries until
+  it sees the matching 0x11/0x01.
 
-v1 = milestones 1–6 (BLE sniffer) DONE. Advertise (7) implemented. Connect (8) implemented,
-one cooperative peer away from a green end-to-end GATT read.
+v1 = milestones 1–6 (BLE sniffer) DONE. Advertise (7) DONE. Connect + GATT discovery (8)
+DONE. This is a working no-root BLE central: scan / advertise / connect / discover.
+Next: read a characteristic value (Read_By_Type + Read), then notifications.
 
 ### Gotchas nailed (for the write-up)
 - fw does NOT survive a USB reset on callback close → each fresh termux-usb invocation is
