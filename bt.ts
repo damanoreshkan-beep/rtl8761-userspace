@@ -553,6 +553,20 @@ if (action === "desc") {
     addAD(0x03, [0xaa, 0xfe]);                                  // Complete 16-bit Service UUIDs = Eddystone
     addAD(0x16, [0xaa, 0xfe, 0x10, 0x00, 0x03, ...Array.from(enc.encode(url))]); // Service Data: URL frame, 0x03 = https://
     label = `Eddystone-URL https://${url}`;
+  } else if (preset === "apple") {
+    // Apple Continuity "Nearby Action" (type 0x0F) — a nearby iPhone/iPad shows a setup popup.
+    // MSD: 4C 00 (Apple) | 0F (Nearby Action) | 05 (len) | action | flags | 3 random auth bytes.
+    const action = parseHex(Deno.env.get("BT_APPLE_ACTION") ?? "27")[0] ?? 0x27; // 0x27 AppleTV, 0x13 Watch, 0x20 AirPods
+    const flags = parseHex(Deno.env.get("BT_APPLE_FLAGS") ?? "00")[0] ?? 0x00;
+    const auth = crypto.getRandomValues(new Uint8Array(3));
+    addAD(0xff, [0x4c, 0x00, 0x0f, 0x05, action, flags, ...Array.from(auth)]);
+    label = `Apple Nearby Action 0x${h(action)} — watch a nearby iPhone/iPad for a popup`;
+  } else if (preset === "fastpair") {
+    // Google Fast Pair discoverable advert — a nearby Android shows a half-sheet. Service Data
+    // 0xFE2C + 3-byte registered Model ID (big-endian). Popup depends on Google's model DB.
+    const model = parseHex(Deno.env.get("BT_FASTPAIR_MODEL") ?? "cd8256");
+    addAD(0x16, [0x2c, 0xfe, model[0] ?? 0, model[1] ?? 0, model[2] ?? 0]); // Service Data: FE2C + model id
+    label = `Fast Pair model=${Array.from(model.subarray(0, 3)).map(h).join("")} — watch a nearby Android for a half-sheet`;
   } else {
     addAD(0x09, [...name]);                                     // plain named advert
     label = `"${new TextDecoder().decode(name)}" — look on a BLE scanner`;
