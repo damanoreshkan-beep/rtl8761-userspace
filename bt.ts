@@ -279,7 +279,7 @@ function discoverServices(handle: number): Svc[] {   // Read_By_Group_Type, Prim
   }
   return svcs;
 }
-interface Char { props: number; valueHandle: number; uuid: string }
+interface Char { declHandle: number; props: number; valueHandle: number; uuid: string }
 function discoverChars(handle: number, sStart: number, sEnd: number): Char[] { // Read_By_Type, Char Decl 0x2803
   const chars: Char[] = [];
   let start = sStart;
@@ -291,7 +291,7 @@ function discoverChars(handle: number, sStart: number, sEnd: number): Char[] { /
     const each = b[1]; let last = 0;
     for (let i = 2; i + each <= b.length; i += each) {
       const declHandle = b[i] | (b[i + 1] << 8);
-      chars.push({ props: b[i + 2], valueHandle: b[i + 3] | (b[i + 4] << 8), uuid: attUuid(b.subarray(i + 5, i + each)) });
+      chars.push({ declHandle, props: b[i + 2], valueHandle: b[i + 3] | (b[i + 4] << 8), uuid: attUuid(b.subarray(i + 5, i + each)) });
       last = declHandle;
     }
     if (last >= sEnd || last < start) break;
@@ -304,6 +304,32 @@ function readChar(handle: number, valueHandle: number): Uint8Array | null { // A
   req[0] = 0x0a; new DataView(req.buffer).setUint16(1, valueHandle, true);
   const b = attTxn(handle, req, 0x0b);
   return b && b[0] === 0x0b ? b.subarray(1) : null;
+}
+// ATT Find_Information over [start,end]: return the handle of the CCCD (UUID 0x2902), or -1.
+function findCCCD(handle: number, start: number, end: number): number {
+  let s = start;
+  while (s <= end && s > 0) {
+    const req = new Uint8Array(5); const rv = new DataView(req.buffer);
+    req[0] = 0x04; rv.setUint16(1, s, true); rv.setUint16(3, end, true);
+    const b = attTxn(handle, req, 0x05);
+    if (!b || b[0] !== 0x05) break;
+    const step = b[1] === 0x01 ? 4 : 18;                     // format: 1=16-bit UUID, 2=128-bit
+    let last = 0;
+    for (let i = 2; i + step <= b.length; i += step) {
+      const hnd = b[i] | (b[i + 1] << 8);
+      if (attUuid(b.subarray(i + 2, i + step)) === "0x2902") return hnd;
+      last = hnd;
+    }
+    if (last >= end || last < s) break;
+    s = last + 1;
+  }
+  return -1;
+}
+function attWrite(handle: number, attHandle: number, value: Uint8Array): boolean { // ATT Write Request 0x12
+  const req = new Uint8Array(3 + value.length);
+  req[0] = 0x12; new DataView(req.buffer).setUint16(1, attHandle, true); req.set(value, 3);
+  const b = attTxn(handle, req, 0x13);
+  return !!b && b[0] === 0x13;
 }
 const GATT_NAMES: Record<string, string> = {
   "0x2a00": "Device Name", "0x2a01": "Appearance", "0x2a04": "Pref Conn Params",
@@ -538,6 +564,54 @@ if (action === "desc") {
     }
   }
   out(`read: done. disconnecting.\n`);
+  disconnect(handle);
+} else if (action === "notify") {
+  // Connect, subscribe to a notify/indicate characteristic's CCCD, stream notifications.
+  if (!claim(0)) { out(`notify: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  const handle = await connectTarget("notify");
+  if (handle < 0) Deno.exit(1);
+  const svcs = discoverServices(handle);
+  const wantUuid = (Deno.env.get("BT_NOTIFY_UUID") ?? "").toLowerCase();
+  // gather every notify/indicate characteristic, then pick the best: prefer NOTIFY over
+  // INDICATE and deprioritize Service Changed (0x2a05), which only fires on a GATT DB change.
+  const cands: { svc: Svc; chars: Char[]; idx: number; score: number }[] = [];
+  for (const s of svcs) {
+    const chars = discoverChars(handle, s.start, s.end);
+    for (let i = 0; i < chars.length; i++) {
+      if (!(chars[i].props & 0x30)) continue;                    // 0x10 notify | 0x20 indicate
+      if (wantUuid && chars[i].uuid.toLowerCase() !== wantUuid) continue;
+      const score = (chars[i].props & 0x10 ? 2 : 0) + (chars[i].uuid === "0x2a05" ? 0 : 1) + (chars[i].uuid.startsWith("0x") ? 1 : 0);
+      cands.push({ svc: s, chars, idx: i, score });
+    }
+  }
+  const chosen = cands.sort((a, b) => b.score - a.score)[0];
+  if (!chosen) { out(`notify: no notify/indicate characteristic found\n`); disconnect(handle); Deno.exit(1); }
+  const c = chosen.chars[chosen.idx];
+  const next = chosen.chars[chosen.idx + 1];
+  const cccd = findCCCD(handle, c.valueHandle + 1, next ? next.declHandle - 1 : chosen.svc.end);
+  const indicate = !(c.props & 0x10) && !!(c.props & 0x20);
+  out(`notify: char ${c.uuid} value_h=0x${c.valueHandle.toString(16)} cccd=${cccd < 0 ? "none" : "0x" + cccd.toString(16)} mode=${indicate ? "indicate" : "notify"}\n`);
+  if (cccd < 0) { out(`notify: no CCCD (0x2902) — cannot subscribe\n`); disconnect(handle); Deno.exit(1); }
+  const cfg = indicate ? 0x0002 : 0x0001;
+  out(`notify: CCCD write ${attWrite(handle, cccd, Uint8Array.from([cfg & 0xff, 0x00])) ? "ok" : "FAILED"}\n`);
+
+  const secs = Number(Deno.env.get("BT_NOTIFY_SECS") ?? "15");
+  out(`notify: listening ${secs}s...\n`);
+  const t0 = Date.now(); let count = 0;
+  while (Date.now() - t0 < secs * 1000) {
+    const r = aclRecv(1000);
+    if (!r || r.cid !== ATT_CID || r.payload.length < 3) continue;
+    const p = r.payload;
+    if (p[0] !== 0x1b && p[0] !== 0x1d) continue;                // notification | indication
+    const ah = p[1] | (p[2] << 8);
+    const v = p.subarray(3);
+    const asc = Array.from(v).map((x) => x >= 0x20 && x < 0x7f ? String.fromCharCode(x) : ".").join("");
+    out(`  [${((Date.now() - t0) / 1000).toFixed(1).padStart(4)}s] h=0x${ah.toString(16).padStart(4, "0")} ${Array.from(v).map(h).join(" ")}  "${asc}"\n`);
+    count++;
+    if (p[0] === 0x1d) aclSend(handle, ATT_CID, Uint8Array.from([0x1e])); // Handle Value Confirmation
+  }
+  out(`notify: ${count} notification(s). unsubscribing + disconnecting.\n`);
+  attWrite(handle, cccd, Uint8Array.from([0x00, 0x00]));
   disconnect(handle);
 } else if (action === "romver") {
   // Read ROM Version: vendor OGF=0x3f, OCF=0x06d (opcode 0xFC6D). Selects the fw patch.

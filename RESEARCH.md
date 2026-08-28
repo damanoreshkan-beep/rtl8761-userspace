@@ -146,10 +146,26 @@ Bugs fixed along the way:
    encryption). Flags R/W/N/I parsed from the declaration; well-known UUIDs named; values as
    hex + ASCII. connect/read share `connectTarget` + `discoverServices` helpers.
 
-v1 = milestones 1–6 (BLE sniffer) DONE. Advertise (7), Connect+discovery (8), Read chars (9)
-DONE. Working no-root BLE central: scan / advertise / connect / discover / read.
-Next: subscribe to notifications (write CCCD 0x2902 = 0x0001, stream Handle Value
-Notifications 0x1b), then characteristic writes.
+10. **Notifications — DONE (green end-to-end).** `notify`: connect → discover → pick a
+    notify/indicate characteristic (auto-picks the best: prefers NOTIFY, well-known 16-bit
+    UUIDs, and skips Service Changed 0x2a05; or `BT_NOTIFY_UUID=<uuid>`) → `Find_Information`
+    (0x04) for its CCCD (0x2902) → `Write_Request` (0x12) CCCD = 0x0001 → stream Handle Value
+    Notifications (0x1b) / Indications (0x1d, auto-Confirm 0x1e). Verified vs a BlueZ Heart
+    Rate GATT server on the box (`/tmp/gatt_hr.py`, python-dbus): **subscribed to 0x2a37 and
+    received one notification/second with the value incrementing 0x3d→…** live. On unsubscribe
+    writes CCCD = 0x0000.
+
+v1 = milestones 1–6 (BLE sniffer) DONE. Advertise (7), Connect+discovery (8), Read chars (9),
+Notifications (10) DONE. Working no-root BLE central: scan / advertise / connect / discover /
+read / subscribe. Next: characteristic writes (Write_Request 0x12 / Write_Command 0x52), then
+a touch-TUI.
+
+## Test rig — box as a BLE peripheral
+`ssh box` (Intel 8260, BlueZ). Two peers, both hold via a live process (advertisement drops
+when it exits): `/tmp/ble_adv.sh <secs>` = bluetoothctl connectable advertiser "mrx-ble" with
+the default GATT DB; `/tmp/gatt_hr.py <secs>` = python-dbus Heart Rate (0x180D/0x2A37) server
+that notifies every second once subscribed. Box BT addr F8:94:C2:4C:6F:7A (public). NB: box
+shell is zsh, no hciconfig — drive it with bluetoothctl / btmgmt.
 
 ### Gotchas nailed (for the write-up)
 - fw does NOT survive a USB reset on callback close → each fresh termux-usb invocation is

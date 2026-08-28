@@ -41,5 +41,6 @@ case "$cmd" in
   adv)    run adv    "$1" ;;
   connect) run connect "$1" ;;
   read)   run read   "$1" ;;
+  notify) run notify "$1" ;;
   *)     echo "unknown: $cmd"; exit 2 ;;
 esac
