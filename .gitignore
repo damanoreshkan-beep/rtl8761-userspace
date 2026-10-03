@@ -2,7 +2,17 @@
 *.bin
 # termux-usb runtime callback the tool writes
 .cb.sh
+# bletx cached dongle path
+.btdev
 # logs / scratch
 *.log
 *.out
 out*.txt
+# adv pid file (resolve-on-exit)
+.advpid
+# ident DB (built by ident/update.ts) + its Gadgetbridge checkout
+ident/db.json
+ident/.gb/
+# live scan FIFO + pid file
+.scanfifo
+.scanpid

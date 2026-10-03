@@ -13,6 +13,7 @@
 #   btctl read   <dev>   # LE connect + discover characteristics + read readable values
 #   btctl notify <dev>   # subscribe to a notify/indicate char. BT_NOTIFY_UUID, BT_NOTIFY_SECS
 #   btctl write  <dev>   # write a writable char + read back. BT_WRITE_HEX=deadbeef, BT_WRITE_UUID
+#   btctl pair   <dev>   # LE Just Works pairing (SMP) + encrypt; BT_PAIR_READ_UUID reads a char after
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DENO="${DENO:-/root/.deno/bin/deno}"
@@ -30,7 +31,9 @@ HOME=/root BT_ACTION="$action" "$DENO" run -A --no-lock "$CORE" "\$1"
 exit 0
 EOF
   chmod +x "$cb"
-  timeout 60 termux-usb -r -e "$cb" "$dev"
+  # manual adv (BT_ADV_SECS=0) and live scan (BT_SCAN_SECS=0) run until the TUI signals them, so no 60s cap
+  if { [ "$action" = adv ] && [ "${BT_ADV_SECS:-}" = 0 ]; } || { [ "$action" = scan ] && [ "${BT_SCAN_SECS:-}" = 0 ]; }; then termux-usb -r -e "$cb" "$dev"
+  else timeout 60 termux-usb -r -e "$cb" "$dev"; fi
 }
 
 cmd="${1:-list}"; shift || true
@@ -46,5 +49,6 @@ case "$cmd" in
   read)   run read   "$1" ;;
   notify) run notify "$1" ;;
   write)  run write  "$1" ;;
+  pair)   run pair   "$1" ;;
   *)     echo "unknown: $cmd"; exit 2 ;;
 esac

