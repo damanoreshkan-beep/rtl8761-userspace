@@ -203,3 +203,101 @@ kill it with `pkill -f '[g]att_hr.py'` (bracket avoids self-match).
 - `bt.ts`   — Deno usbfs HCI core (termux-usb callback). Recon slice today; grows per §4.
 - `btctl.sh`— front-end: `list` / `desc` / `hci`. Grows: `romver` / `fwdl` / `scan`.
 - fw blobs — fetched, gitignored.
+
+---
+
+## 6. Controller capabilities & firmware internals (2026-10-04)
+
+Read-only HCI probe (`wisp caps` / `btctl caps`) — MEASURED on our dongle (LMP subver 0xd922):
+
+```
+LMP features: SCO=true HV2/HV3=true  eSCO/EV3/EV4/EV5=true   (classic voice links)
+              BR/EDR_not_supported(LE-only)=false  LE_supported=true
+buffers:      ACL=1021B x6   SCO=255B x12
+classic cmds: Inquiry=true Create_Connection=true Setup_Synchronous_Connection=true
+LE cmds:      LE_Set_Scan / LE_Create_Connection=true
+test cmds:    LE_Receiver/Transmitter_Test=true  LE_Test_End=true   (octet28=0x7f)
+              BR/EDR Enable_Device_Under_Test_Mode / Read+Write_Loopback=true (octet16=0x3f)
+```
+
+So the silicon is full dual-mode and exposes the standard test facilities. NB: continuous
+single-carrier TX is NOT a plain HCI command — it lives in Realtek's factory "MP" code
+(`CONTINUE_TX`/`LE_CONTINUE_TX`, per-channel, TX-gain), reachable only via the closed
+`rtlbtmp` binary or by recovering the VSC opcode from the firmware (see below).
+
+### Memory read/write over stock firmware — WORKS, no custom fw
+
+The RTL8761B stock firmware answers two **native** Realtek vendor commands (confirmed, read-only
+path tested; proven by DarkFirmware's `Memory_Reader.py` which downloads no patch):
+
+- `0xFC61` **Read_Mem**: params = size(1) + address(4 LE). Returns one 32-bit word per call.
+- `0xFC62` **Write_Mem**: size + address(4 LE) + data(4 LE).  *(not wired up — can corrupt runtime state)*
+
+`wisp mem <addr> <len> [outfile]` (`bt.ts` action `mem`) dumps via 0xFC61 (one word / call,
+~3 ms/word). Full dump saved to `research/dumps/` (gitignored). Valid ranges found:
+
+```
+0x80000000–0x80114000   code+data   (0x80000000 and 0x80080000 are MIRRORS of each other)
+0x80120000–0x80134000   RAM / patch region (our downloaded patch lands here)
+elsewhere               0xdeadbeef = invalid/unmapped
+```
+
+### Custom firmware — feasible, NOT signed
+
+Reference: **DarkMentor LLC `DarkFirmware_real_i`** (cloned to `research/`, gitignored).
+Key facts:
+- The ePatch format is validated only by a **magic string** (`"Realtech"`/`"RTBTCore"`) +
+  structural fields — **no cryptographic signature**. Modified patches load and run.
+- Our stock `rtl8761bu_fw.bin` is **byte-identical** (md5 `e6da3f44…`) to the one their patch
+  targets, so every hard-coded address lines up with our chip.
+- Patch is a MIPS16e inline hook appended to the stock fw, downloaded over our existing
+  `0xFC20` path. **Ephemeral** — gone on power-cycle. Their PoC adds VSC OCF `0x222` that
+  injects a raw LMP packet onto connection 0 and relays received LMP via vendor event `0xFF`.
+- Named addresses from their Ghidra analysis (match our dump): VSC dispatch
+  `HCI_CMD_OGF_3F__Vendor_Specific__FUN_80030f1c`, LMP handler ptr `0x8012aed4`,
+  `memcpy 0x8000e85d`, `send_LMP_reply 0x800611e5`, `hci_evt_sender 0x8001d071`.
+- Toolchain to BUILD a patch: `gcc-mips-linux-gnu` + `binutils-mipsel-linux-gnu`
+  (`mipsel-linux-gnu-as -mips32r2 -mips16`). To LOAD it we need no scapy/Linux-driver dance —
+  our own `fw.ts` + `0xFC20` download does it (drop the patched fw.bin in place of stock).
+
+### Disassembly state
+
+MIPS16e is NOT disassemblable with what's on the box: `objdump` has no MIPS target, and
+`capstone` 5.0.7 has no MIPS16 mode. Real disasm route = **Ghidra** (their repo ships
+`.gzf` project exports with functions already named) or a purpose-built MIPS16e decoder.
+
+### Open idea — 2.4 GHz detector (reflash our own dongle)
+
+Owner wants to reflash the dongle into a 2.4 GHz presence detector ("find surveillance gear").
+Honest feasibility (to validate, not promised):
+- **Strong**: it already finds BLE devices (`wisp scan`) and can do classic `Inquiry` — most
+  modern hidden cameras/bugs are Wi-Fi or BLE, and BLE ones show up directly.
+- **Maybe**: per-channel RSSI / energy read — if the firmware exposes a vendor RSSI-on-channel
+  op (to be found in the dump) we could sweep the 2.4 GHz channels and report energy.
+- **No**: true wideband RF power detection of arbitrary/analog emitters. A BT controller only
+  reports RSSI tied to BT packets it decodes; raw spectral energy of non-BT transmitters needs
+  an SDR. The chip is a BT/BLE detector, not a general bug sweeper.
+
+NEXT (when picked up): decide disasm route (Ghidra vs targeted MIPS16e decoder) → find the VSC
+dispatch table at `0x80030f1c` and any RSSI/energy vendor op → scope the detector against what
+the radio can actually report.
+
+### Detector — IMPLEMENTED (BLE side, 2026-10-04)
+
+`wisp scan` / TUI now flag surveillance beacons and decode Apple devices (passive, stock fw).
+Signatures per seemoo-lab/AirGuard + furiousMAC/continuity + Google FMDN spec. Lives in `ident.ts`.
+
+- **Trackers** (`trackerLabel`): Apple Find My `0x004C`+Continuity `0x12`; Tile `0xFEED/0xFEEC`;
+  Chipolo `0xFE33`; Samsung SmartTag `0xFD5A`; Samsung Find My Mobile `0xFD69`;
+  Pebblebee `0xFA25`; Google Find My Device (Eddystone) `0xFEAA`.
+- **Apple Continuity** (`appleContinuity`): message types `0x02..0x12` (table unchanged since the
+  2019 RE work — no new top-level types as of iOS 26/27). Proximity Pairing `0x07` resolves the
+  2-byte model ID → AirPods/Beats name (table incl. AirPods Pro 3 `0x2720`, Pro 2 USB-C `0x2420`).
+  Nearby Info `0x10` decodes the device-state apple_bleee surfaces: action code (screen on / locked
+  / audio / video / CALL / DRIVING), WiFi on-off, primary-iCloud, AirDrop-rx (furiousMAC nearby_info.md).
+- **TUI**: new `APPLE` tab lists only Apple devices + trackers, trackers highlighted.
+- Current Apple OS at implementation time: **iOS 26.7.1 / 27.0.1** (both 2026-09-28); AirTag 2
+  exists since iOS 26.2.1 but no public BLE-signature change (assume same `0x12` Find My).
+
+Limits: BLE only. Wi-Fi cameras/devices need the AX56 (RTL8852AU) — separate tool.
+apple_bleee's phone-number recovery is a Wi-Fi/AWDL attack, NOT reproducible on this BT dongle.

@@ -32,7 +32,7 @@ exit 0
 EOF
   chmod +x "$cb"
   # manual adv (BT_ADV_SECS=0) and live scan (BT_SCAN_SECS=0) run until the TUI signals them, so no 60s cap
-  if { [ "$action" = adv ] && [ "${BT_ADV_SECS:-}" = 0 ]; } || { [ "$action" = scan ] && [ "${BT_SCAN_SECS:-}" = 0 ]; }; then termux-usb -r -e "$cb" "$dev"
+  if { [ "$action" = adv ] && [ "${BT_ADV_SECS:-}" = 0 ]; } || { [ "$action" = scan ] && [ "${BT_SCAN_SECS:-}" = 0 ]; } || [ "$action" = mem ]; then termux-usb -r -e "$cb" "$dev"
   else timeout 60 termux-usb -r -e "$cb" "$dev"; fi
 }
 
@@ -42,6 +42,8 @@ case "$cmd" in
   desc)   run desc   "$1" ;;
   hci)    run hci    "$1" ;;
   romver) run romver "$1" ;;
+  caps)   run caps   "$1" ;;
+  mem)    run mem    "$1" ;;
   fwdl)   run fwdl   "$1" ;;
   scan)   run scan   "$1" ;;
   adv)    run adv    "$1" ;;

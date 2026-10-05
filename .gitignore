@@ -16,3 +16,5 @@ ident/.gb/
 # live scan FIFO + pid file
 .scanfifo
 .scanpid
+# cloned RE repos + memory dumps (large/binary, regenerable)
+research/

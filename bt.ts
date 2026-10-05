@@ -177,7 +177,7 @@ function attRecv(timeout = 2500): Uint8Array | null {
 // Parse the AD structures in ev[p..end): local name, advertised service UUIDs (16/128-bit lists +
 // 16-bit service data), manufacturer-data company IDs. UUIDs use attUuid's text form.
 function parseAd(ev: Uint8Array, p: number, end: number) {
-  let name = "", appearance = 0; const uuids: string[] = []; const companies: number[] = [];
+  let name = "", appearance = 0, appleType = 0; let appleMsd: number[] = []; const uuids: string[] = []; const companies: number[] = [];
   for (let q = p; q + 2 <= end;) {
     const l = ev[q], t = ev[q + 1];
     if (l === 0 || q + 1 + l > end) break;
@@ -186,15 +186,15 @@ function parseAd(ev: Uint8Array, p: number, end: number) {
     else if (t === 0x02 || t === 0x03) for (let i = 0; i + 2 <= d.length; i += 2) uuids.push(attUuid(d.subarray(i, i + 2)));
     else if (t === 0x06 || t === 0x07) for (let i = 0; i + 16 <= d.length; i += 16) uuids.push(attUuid(d.subarray(i, i + 16)));
     else if (t === 0x16 && d.length >= 2) uuids.push(attUuid(d.subarray(0, 2)));
-    else if (t === 0xff && d.length >= 2) companies.push(d[0] | (d[1] << 8));
+    else if (t === 0xff && d.length >= 2) { const c = d[0] | (d[1] << 8); companies.push(c); if (c === 0x004c && d.length >= 3) { appleType = d[2]; appleMsd = Array.from(d.subarray(2)); } }
     else if (t === 0x19 && d.length >= 2) appearance = d[0] | (d[1] << 8);
     q += l + 1;
   }
-  return { name, appearance, uuids, companies };
+  return { name, appearance, appleType, appleMsd, uuids, companies };
 }
 const uniq = <T,>(a: T[]) => [...new Set(a)];
 
-interface AdvRec { addr: Uint8Array; addrType: number; eventType: number; rssi: number; name: string; uuids: string[]; companies: number[] }
+interface AdvRec { addr: Uint8Array; addrType: number; eventType: number; rssi: number; name: string; uuids: string[]; companies: number[]; appleType: number }
 // Run an LE active scan for `secs` and return records keyed by MAC (assumes patched + claimed).
 function scanCollect(secs: number): Map<string, AdvRec> {
   const ff = new Uint8Array(8).fill(0xff);
@@ -222,6 +222,7 @@ function scanCollect(secs: number): Map<string, AdvRec> {
       const prev = seen.get(mac);
       // scan responses (eventType 0x04) carry the name but not connectability — keep the ADV_* type
       seen.set(mac, { addr, addrType, eventType: eventType === 0x04 && prev ? prev.eventType : eventType, rssi, name: ad.name || prev?.name || "",
+        appleType: ad.appleType || prev?.appleType || 0,
         uuids: uniq([...(prev?.uuids ?? []), ...ad.uuids]), companies: uniq([...(prev?.companies ?? []), ...ad.companies]) });
     }
   }
@@ -558,10 +559,11 @@ if (action === "desc") {
   }
   out(`scan: listening ${live ? "until stopped" : secs + "s"}...\n`);
   const seen = new Map<string, AdvInfo & { rssi: number; appearance: number }>();
-  // line: "<mac>  <signal>%  <name>  [<appearance>]  ~ <ident>" — the TUI splits [..] and "~ .." off the name
+  // line: "<mac>  <signal>%  public|random  <name>  [<appearance>]  ~ <ident>" — the TUI splits [..] and "~ .." off the name
   const line = (v: AdvInfo & { rssi: number; appearance: number }) => {
     const ap = appearanceName(v.appearance), id = identDevice(v);
-    return `  ${v.mac}  ${String(signalPct(v.rssi)).padStart(3)}%  ${v.name}${ap ? "  [" + ap + "]" : ""}${id ? "  ~ " + id : ""}\n`;
+    const kind = v.addrType & 1 ? "random" : "public";            // 0/2 public (identity), 1/3 random
+    return `  ${v.mac}  ${String(signalPct(v.rssi)).padStart(3)}%  ${kind}  ${v.name}${ap ? "  [" + ap + "]" : ""}${id ? "  ~ " + id : ""}\n`;
   };
   const sent = new Map<string, { at: number; text: string }>();   // live: last line streamed per MAC
   const t0 = Date.now();
@@ -584,6 +586,7 @@ if (action === "desc") {
       const rssi = ev[p] > 127 ? ev[p] - 256 : ev[p]; p++;        // signed
       const prev = seen.get(mac);
       const v = { mac, addrType, rssi, name: ad.name || prev?.name || "", appearance: ad.appearance || prev?.appearance || 0,
+        appleType: ad.appleType || prev?.appleType || 0, appleMsd: ad.appleMsd.length ? ad.appleMsd : (prev?.appleMsd ?? []),
         uuids: uniq([...(prev?.uuids ?? []), ...ad.uuids]), companies: uniq([...(prev?.companies ?? []), ...ad.companies]) };
       seen.set(mac, v);
       if (liveFh) {                                               // stream: a new MAC at once, its updates ≤1/s
@@ -641,7 +644,8 @@ if (action === "desc") {
       return [0x0e, 0xff, 0x75, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01, 0xff, 0x00, 0x00, 0x43, pick(SWATCH)];
     };
     const buildGoogle = (): number[] => { const m = pick(FPAIR); return [0x03, 0x03, 0x2c, 0xfe, 0x06, 0x16, 0x2c, 0xfe, (m >> 16) & 0xff, (m >> 8) & 0xff, m & 0xff, 0x02, 0x0a, ((rnd(1)[0] % 25) - 20) & 0xff]; };
-    const buildWindows = (): number[] => { const nm = Array.from(enc.encode(pick(SWIFT))).slice(0, 24); return [6 + nm.length, 0xff, 0x06, 0x00, 0x03, 0x00, 0x80, ...nm]; };
+    const advName = Deno.env.get("BT_ADV_NAME") ?? "";   // custom Swift Pair name; empty = rotate SWIFT list
+    const buildWindows = (): number[] => { const nm = Array.from(enc.encode(advName || pick(SWIFT))).slice(0, 24); return [6 + nm.length, 0xff, 0x06, 0x00, 0x03, 0x00, 0x80, ...nm]; };
 
     const secs = Number(Deno.env.get("BT_ADV_SECS") ?? "30");
     const interval = (preset === "windows" || preset === "google") ? 100 : preset === "all" ? 150 : 200;
@@ -917,6 +921,67 @@ if (action === "desc") {
   out(`  event: ${hex(ev, n)}\n`);
   // 0e len ncmd op_lo op_hi status rom_version
   if (n >= 7 && ev[0] === 0x0e) out(`  status=${h(ev[5])} rom_version=0x${h(ev[6])}\n`);
+} else if (action === "mem") {
+  // Read chip memory via the stock Realtek vendor command 0xFC61 (OGF 0x3f, OCF 0x061):
+  // params = size(1) + address(4 LE). Read-only. BT_MEM_ADDR / BT_MEM_LEN / BT_MEM_OUT / BT_MEM_STEP.
+  if (!claim(0)) { out(`mem: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  await ensurePatched();
+  const begin = Number(Deno.env.get("BT_MEM_ADDR") ?? "0x80000000");
+  const len = Number(Deno.env.get("BT_MEM_LEN") ?? "0x40");
+  const outPath = Deno.env.get("BT_MEM_OUT") ?? "";
+  const buf = new Uint8Array(len);
+  let got = 0, fail = 0;
+  // 0xFC61 returns one 32-bit word per read; size byte 0x20 is what the stock tool sends.
+  for (let off = 0; off < len; off += 4) {
+    const addr = (begin + off) >>> 0;
+    const p = new Uint8Array(5); p[0] = 0x20; new DataView(p.buffer).setUint32(1, addr, true);
+    const { status, ret } = cmdC(0x3f, 0x061, p);
+    if (off === 0) out(`mem: first read @0x${addr.toString(16)} status=${status} retlen=${ret.length} raw=${hex(ret, Math.min(ret.length, 16))}\n`);
+    if (status !== 0 || ret.length < 4) { fail++; continue; }
+    const n = Math.min(4, len - off);
+    buf.set(ret.subarray(0, n), off); got += n;
+  }
+  out(`mem: read 0x${got.toString(16)} / 0x${len.toString(16)} bytes from 0x${(begin >>> 0).toString(16)} (${fail} failed reads)\n`);
+  if (outPath) { Deno.writeFileSync(outPath, buf); out(`mem: saved -> ${outPath}\n`); }
+  else { for (let i = 0; i < len; i += 16) out(`  0x${(begin + i >>> 0).toString(16)}  ${hex(buf.subarray(i, i + 16))}\n`); }
+} else if (action === "caps") {
+  // Read-only capability probe: does this controller support classic BR/EDR (and thus the
+  // classic audio stack an earbud needs)? No RF is transmitted — only local reads.
+  if (!claim(0)) { out(`caps: claim iface0 failed errno=${errno()}\n`); Deno.exit(1); }
+  await ensurePatched();
+  // Read_Local_Features (OGF 0x04, OCF 0x003): LMP feature bits, byte 4 bit1 = BR/EDR Not Supported (LE-only)
+  const feat = cmdC(0x04, 0x003);
+  if (feat.status === 0 && feat.ret.length >= 8) {
+    const f = feat.ret;
+    out(`caps: LMP features ${hex(f)}\n`);
+    out(`caps:   3-slot=${!!(f[0] & 0x01)} 5-slot=${!!(f[0] & 0x02)} encryption=${!!(f[0] & 0x04)}\n`);
+    out(`caps:   SCO=${!!(f[1] & 0x08)} HV2=${!!(f[1] & 0x10)} HV3=${!!(f[1] & 0x20)}  (classic voice link types)\n`);
+    out(`caps:   eSCO/EV3=${!!(f[3] & 0x80)} EV4=${!!(f[4] & 0x01)} EV5=${!!(f[4] & 0x02)}  (enhanced voice link types)\n`);
+    out(`caps:   BR/EDR_not_supported(LE-only)=${!!(f[4] & 0x20)}  LE_supported=${!!(f[4] & 0x40)}\n`);
+  } else out(`caps: Read_Local_Features failed status=${feat.status}\n`);
+  // Read_Buffer_Size (OGF 0x04, OCF 0x005): ACL + SCO buffer sizes. SCO size 0 => no classic audio buffers.
+  const buf = cmdC(0x04, 0x005);
+  if (buf.status === 0 && buf.ret.length >= 7) {
+    const b = buf.ret;
+    const aclLen = b[0] | (b[1] << 8), scoLen = b[2], aclN = b[3] | (b[4] << 8), scoN = b[5] | (b[6] << 8);
+    out(`caps: buffers  ACL=${aclLen}B x${aclN}   SCO=${scoLen}B x${scoN}\n`);
+  }
+  // Read_Local_Supported_Commands (OGF 0x04, OCF 0x002): 64-byte bitmap. Probe the few that matter.
+  const cmd = cmdC(0x04, 0x002);
+  if (cmd.status === 0 && cmd.ret.length >= 64) {
+    const c = cmd.ret;
+    const has = (octet: number, bit: number) => !!(c[octet] & (1 << bit));
+    out(`caps: classic commands  Inquiry=${has(0, 0)} Create_Connection=${has(0, 4)} ` +
+      `Setup_Synchronous_Connection=${has(16, 3)} Enhanced_Setup_Sync_Conn=${has(29, 3)}\n`);
+    out(`caps: LE commands       LE_Set_Scan=${has(26, 5)} LE_Create_Connection=${has(26, 4)}\n`);
+    // Test/transmit modes — the only HCI route anywhere near a continuous carrier. Per Core spec
+    // Supported Commands table: LE Receiver/Transmitter/Test_End = octet 28 bits 4/5/6;
+    // BR/EDR Enable_Device_Under_Test_Mode = octet 16 bit 2. Raw octets printed so it is verifiable.
+    out(`caps: LE test            LE_Receiver_Test=${has(28, 4)} LE_Transmitter_Test=${has(28, 5)} LE_Test_End=${has(28, 6)}\n`);
+    out(`caps: BR/EDR test        Enable_Device_Under_Test_Mode=${has(16, 2)} Read_Loopback=${has(16, 0)} Write_Loopback=${has(16, 1)}\n`);
+    out(`caps: raw octet16=0x${h(c[16])} octet28=0x${h(c[28])}\n`);
+  }
+  out(`caps: done\n`);
 } else {
   out(`unknown action: ${action}\n`);
   Deno.exit(2);
